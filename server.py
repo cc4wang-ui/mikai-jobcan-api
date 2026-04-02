@@ -6,6 +6,7 @@ FastAPI + Playwright (Headless Chromium)
   v1 → v2: wf.jobcan.jp → ssl.wf.jobcan.jp (DNS解決問題修正)
            ログインフロー修正 (id.jobcan.jp/account/profile 対応)
            全 timeout 明示化、エラーハンドリング強化
+  v2 → v2.1: ssl.wf.jobcan.jp の networkidle → domcontentloaded (SPA timeout 修正)
 
 API:
   POST /api/fill   — Jobcan ログイン → 自動填入 → 下書き保存
@@ -133,7 +134,7 @@ class FillResult(BaseModel):
 # App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title='mikai Jobcan Bridge', version='2.0.0')
+app = FastAPI(title='mikai Jobcan Bridge', version='2.1.0')
 
 app.add_middleware(
     CORSMiddleware,
@@ -272,7 +273,7 @@ async def goto_wf(page):
     try:
         target = JOBCAN_WF_BASE + '/'
         print(f'[LOGIN] goto {target}')
-        await page.goto(target, wait_until='networkidle', timeout=30000)
+        await page.goto(target, wait_until='domcontentloaded', timeout=30000)
         await page.wait_for_timeout(2000)
     except Exception as e:
         return {'ok': False, 'reason': f'WF接続失敗: {str(e)[:100]}', 'url': page.url, 'title': await stitle(page)}
@@ -292,7 +293,7 @@ async def process_item(page, item, action):
         url = JOBCAN_FORM_URLS.get(item.flow_type, JOBCAN_FORM_URLS['発注稟議'])
         print(f'[ITEM] goto {url}')
         try:
-            await page.goto(url, wait_until='networkidle', timeout=30000)
+            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
         except Exception as e:
             return FillResult(row_num=item.row_num, title=item.title, status='error',
                               filled=0, errors=[f'フォーム接続失敗: {str(e)[:80]}'],
