@@ -7,6 +7,7 @@ FastAPI + Playwright (Headless Chromium)
            ログインフロー修正 (id.jobcan.jp/account/profile 対応)
            全 timeout 明示化、エラーハンドリング強化
   v2 → v2.1: ssl.wf.jobcan.jp の networkidle → domcontentloaded (SPA timeout 修正)
+  v2.1 → v2.2: SPA hash routing (page.goto → window.location.hash) + form retry
 
 API:
   POST /api/fill   — Jobcan ログイン → 自動填入 → 下書き保存
@@ -274,7 +275,7 @@ async def goto_wf(page):
         target = JOBCAN_WF_BASE + '/'
         print(f'[LOGIN] goto {target}')
         await page.goto(target, wait_until='domcontentloaded', timeout=30000)
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(5000)  # AngularJS 初期化待ち
     except Exception as e:
         return {'ok': False, 'reason': f'WF接続失敗: {str(e)[:100]}', 'url': page.url, 'title': await stitle(page)}
 
@@ -290,20 +291,40 @@ async def goto_wf(page):
 
 async def process_item(page, item, action):
     try:
-        url = JOBCAN_FORM_URLS.get(item.flow_type, JOBCAN_FORM_URLS['発注稟議'])
-        print(f'[ITEM] goto {url}')
+        form_id = '666628' if item.flow_type == '発注稟議' else '666591'
+        hash_path = f'#/requests/new/{form_id}'
+        print(f'[ITEM] navigate to {hash_path}')
+
         try:
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            # SPA 内なのでハッシュルーティングで遷移（page.goto は AngularJS に中断される）
+            current_url = page.url
+            if 'ssl.wf.jobcan.jp' in current_url or 'wf.jobcan.jp' in current_url:
+                # 既に WF 上にいる → hash だけ変更
+                await page.evaluate(f'window.location.hash = "{hash_path}"')
+            else:
+                # WF 上にいない → フル遷移
+                await page.goto(JOBCAN_WF_BASE + '/' + hash_path, wait_until='domcontentloaded', timeout=30000)
         except Exception as e:
             return FillResult(row_num=item.row_num, title=item.title, status='error',
-                              filled=0, errors=[f'フォーム接続失敗: {str(e)[:80]}'],
+                              filled=0, errors=[f'フォーム遷移失敗: {str(e)[:80]}'],
                               message='フォームを開けません。')
 
-        await page.wait_for_timeout(4000)
-        fc = await page.evaluate('document.querySelectorAll("input,select,textarea").length')
-        print(f'[ITEM] {fc} form elements found')
-        if fc < 3:
+        # AngularJS レンダリング待ち（SPA のルート変更後）
+        await page.wait_for_timeout(5000)
+
+        # フォーム要素の存在確認（リトライ付き）
+        fc = 0
+        for retry in range(3):
+            fc = await page.evaluate('document.querySelectorAll("input,select,textarea").length')
+            print(f'[ITEM] attempt {retry+1}: {fc} form elements')
+            if fc >= 5:
+                break
             await page.wait_for_timeout(3000)
+
+        if fc < 3:
+            return FillResult(row_num=item.row_num, title=item.title, status='error',
+                              filled=0, errors=['フォームが読み込まれません'],
+                              message=f'フォーム要素が {fc} 個しか見つかりません。')
 
         filled, errors = await fill_form(page, item.payload)
 
