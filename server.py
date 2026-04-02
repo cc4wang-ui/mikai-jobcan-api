@@ -174,6 +174,7 @@ async def fill_jobcan(req: FillRequest, x_api_key: Optional[str] = Header(None))
     results = []
 
     async with async_playwright() as p:
+        print(f'[FILL] Starting browser for {req.email}...')
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -181,25 +182,37 @@ async def fill_jobcan(req: FillRequest, x_api_key: Optional[str] = Header(None))
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
-                '--single-process',
+                '--disable-blink-features=AutomationControlled',
             ]
         )
         context = await browser.new_context(
             viewport={'width': 1280, 'height': 900},
             locale='ja-JP',
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         )
+        # navigator.webdriver を隠す
+        await context.add_init_script('''
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        ''')
         page = await context.new_page()
 
         # ── Step 1: ログイン ──
         try:
-            login_ok = await login_jobcan(page, req.email, req.password)
-            if not login_ok:
+            login_result = await login_jobcan(page, req.email, req.password)
+            if not login_result['ok']:
+                print(f'[FILL] Login failed: {login_result["reason"]}')
                 await browser.close()
                 return JSONResponse(
                     status_code=401,
-                    content={'error': 'Jobcan ログイン失敗。メール/パスワードを確認してください。'}
+                    content={
+                        'error': f'Jobcan ログイン失敗: {login_result["reason"]}',
+                        'debug_url': login_result.get('url', ''),
+                        'debug_title': login_result.get('title', ''),
+                    }
                 )
+            print(f'[FILL] Login success for {req.email}')
         except Exception as e:
+            print(f'[FILL] Login exception: {str(e)}')
             await browser.close()
             return JSONResponse(
                 status_code=500,
@@ -220,27 +233,70 @@ async def fill_jobcan(req: FillRequest, x_api_key: Optional[str] = Header(None))
 # Jobcan ログイン
 # ══════════════════════════════════════════════════════════
 
-async def login_jobcan(page, email: str, password: str) -> bool:
-    """Jobcan にログイン — 成功なら True"""
+async def login_jobcan(page, email: str, password: str) -> dict:
+    """Jobcan にログイン — 結果を dict で返す"""
+    print(f'[LOGIN] Navigating to {JOBCAN_LOGIN_URL}...')
     await page.goto(JOBCAN_LOGIN_URL, wait_until='networkidle')
-    await page.wait_for_timeout(1000)
+    await page.wait_for_timeout(2000)
 
-    # メール入力
+    current_url = page.url
+    current_title = await page.title()
+    print(f'[LOGIN] Page loaded: {current_url} | Title: {current_title}')
+
+    # ログインページか確認
     email_input = await page.query_selector('#user_email')
     if not email_input:
-        raise Exception('ログインページが表示されません')
+        # SSO リダイレクト等でログインページではない場合
+        page_text = await page.evaluate('document.body ? document.body.innerText.substring(0, 500) : ""')
+        print(f'[LOGIN] No email field found. Page text: {page_text[:200]}')
+        return {
+            'ok': False,
+            'reason': f'ログインページが表示されません。URL: {current_url}',
+            'url': current_url,
+            'title': current_title,
+        }
 
+    # メール/パスワード入力
+    print(f'[LOGIN] Filling credentials for {email}...')
     await page.fill('#user_email', email)
     await page.fill('#user_password', password)
+    await page.wait_for_timeout(500)
     await page.click('[name="commit"]')
 
-    # ログイン完了を待機（最大 15 秒）
+    # ログイン完了を待機（最大 20 秒）
+    print('[LOGIN] Waiting for redirect...')
     try:
-        await page.wait_for_url('**/wf.jobcan.jp/**', timeout=15000)
-        return True
+        await page.wait_for_url('**/wf.jobcan.jp/**', timeout=20000)
+        print(f'[LOGIN] Success! URL: {page.url}')
+        return {'ok': True}
     except Exception:
-        # ログイン失敗（パスワード間違い等）
-        return False
+        pass
+
+    # 失敗 — 原因を特定
+    final_url = page.url
+    final_title = await page.title()
+    page_text = await page.evaluate('document.body ? document.body.innerText.substring(0, 1000) : ""')
+    print(f'[LOGIN] Failed. URL: {final_url} | Title: {final_title}')
+    print(f'[LOGIN] Page text: {page_text[:300]}')
+
+    reason = 'メール/パスワードが正しくないか、追加認証が必要です。'
+
+    # エラーメッセージ検出
+    if 'メールアドレスまたはパスワード' in page_text:
+        reason = 'メールアドレスまたはパスワードが正しくありません。'
+    elif 'CAPTCHA' in page_text.upper() or 'recaptcha' in page_text.lower():
+        reason = 'CAPTCHA が表示されています。Jobcan が自動ログインをブロックしています。'
+    elif '二段階認証' in page_text or '認証コード' in page_text or 'two-factor' in page_text.lower():
+        reason = '二段階認証（2FA）が有効です。Jobcan の設定で 2FA を無効にしてください。'
+    elif 'id.jobcan.jp' in final_url:
+        reason = f'ログインページから遷移しません。ページ内容: {page_text[:100]}'
+
+    return {
+        'ok': False,
+        'reason': reason,
+        'url': final_url,
+        'title': final_title,
+    }
 
 
 # ══════════════════════════════════════════════════════════
