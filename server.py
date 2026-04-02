@@ -243,10 +243,21 @@ async def login_jobcan(page, email: str, password: str) -> dict:
     current_title = await page.title()
     print(f'[LOGIN] Page loaded: {current_url} | Title: {current_title}')
 
+    # 既にログイン済みの場合（cookie有効）
+    if 'wf.jobcan.jp' in current_url:
+        print('[LOGIN] Already logged in!')
+        return {'ok': True}
+
     # ログインページか確認
     email_input = await page.query_selector('#user_email')
     if not email_input:
-        # SSO リダイレクト等でログインページではない場合
+        # id.jobcan.jp にいる場合 = 既にログイン済み → wf に飛ぶ
+        if 'id.jobcan.jp' in current_url and 'sign_in' not in current_url:
+            print('[LOGIN] Already authenticated, navigating to WF...')
+            await page.goto('https://wf.jobcan.jp/', wait_until='networkidle')
+            await page.wait_for_timeout(2000)
+            if 'wf.jobcan.jp' in page.url:
+                return {'ok': True}
         page_text = await page.evaluate('document.body ? document.body.innerText.substring(0, 500) : ""')
         print(f'[LOGIN] No email field found. Page text: {page_text[:200]}')
         return {
@@ -263,39 +274,43 @@ async def login_jobcan(page, email: str, password: str) -> dict:
     await page.wait_for_timeout(500)
     await page.click('[name="commit"]')
 
-    # ログイン完了を待機（最大 20 秒）
+    # ログイン後の遷移を待機（最大 20 秒）
+    # Jobcan は wf.jobcan.jp ではなく id.jobcan.jp/account/profile に飛ぶことがある
     print('[LOGIN] Waiting for redirect...')
     try:
-        await page.wait_for_url('**/wf.jobcan.jp/**', timeout=20000)
-        print(f'[LOGIN] Success! URL: {page.url}')
-        return {'ok': True}
+        await page.wait_for_url(lambda url: 'sign_in' not in url, timeout=20000)
     except Exception:
         pass
 
-    # 失敗 — 原因を特定
-    final_url = page.url
-    final_title = await page.title()
-    page_text = await page.evaluate('document.body ? document.body.innerText.substring(0, 1000) : ""')
-    print(f'[LOGIN] Failed. URL: {final_url} | Title: {final_title}')
-    print(f'[LOGIN] Page text: {page_text[:300]}')
+    await page.wait_for_timeout(2000)
+    after_url = page.url
+    print(f'[LOGIN] After login URL: {after_url}')
 
-    reason = 'メール/パスワードが正しくないか、追加認証が必要です。'
+    # sign_in ページのまま = ログイン失敗
+    if 'sign_in' in after_url:
+        page_text = await page.evaluate('document.body ? document.body.innerText.substring(0, 500) : ""')
+        reason = 'メール/パスワードが正しくありません。'
+        if 'CAPTCHA' in page_text.upper() or 'recaptcha' in page_text.lower():
+            reason = 'CAPTCHA が表示されています。'
+        elif '二段階認証' in page_text or '認証コード' in page_text:
+            reason = '二段階認証（2FA）が有効です。'
+        return {'ok': False, 'reason': reason, 'url': after_url, 'title': await page.title()}
 
-    # エラーメッセージ検出
-    if 'メールアドレスまたはパスワード' in page_text:
-        reason = 'メールアドレスまたはパスワードが正しくありません。'
-    elif 'CAPTCHA' in page_text.upper() or 'recaptcha' in page_text.lower():
-        reason = 'CAPTCHA が表示されています。Jobcan が自動ログインをブロックしています。'
-    elif '二段階認証' in page_text or '認証コード' in page_text or 'two-factor' in page_text.lower():
-        reason = '二段階認証（2FA）が有効です。Jobcan の設定で 2FA を無効にしてください。'
-    elif 'id.jobcan.jp' in final_url:
-        reason = f'ログインページから遷移しません。ページ内容: {page_text[:100]}'
+    # ログイン成功 — wf.jobcan.jp に手動遷移
+    if 'wf.jobcan.jp' not in after_url:
+        print('[LOGIN] Login OK, navigating to wf.jobcan.jp...')
+        await page.goto('https://wf.jobcan.jp/', wait_until='networkidle')
+        await page.wait_for_timeout(2000)
+
+    if 'wf.jobcan.jp' in page.url or 'id.jobcan.jp' in page.url:
+        print(f'[LOGIN] Success! Final URL: {page.url}')
+        return {'ok': True}
 
     return {
         'ok': False,
-        'reason': reason,
-        'url': final_url,
-        'title': final_title,
+        'reason': f'予期しないURL: {page.url}',
+        'url': page.url,
+        'title': await page.title(),
     }
 
 
