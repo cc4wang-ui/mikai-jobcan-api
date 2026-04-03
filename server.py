@@ -292,34 +292,72 @@ async def goto_wf(page):
 async def process_item(page, item, action):
     try:
         form_id = '666628' if item.flow_type == '発注稟議' else '666591'
-        hash_path = f'#/requests/new/{form_id}'
-        print(f'[ITEM] navigate to {hash_path}')
+        hash_path = f'/requests/new/{form_id}'
+        print(f'[ITEM] navigate to #{hash_path}')
 
         try:
-            # SPA 内なのでハッシュルーティングで遷移（page.goto は AngularJS に中断される）
             current_url = page.url
             if 'ssl.wf.jobcan.jp' in current_url or 'wf.jobcan.jp' in current_url:
-                # 既に WF 上にいる → hash だけ変更
-                await page.evaluate(f'window.location.hash = "{hash_path}"')
+                # SPA 内: hash 変更 + AngularJS ルーター通知
+                await page.evaluate('''(path) => {
+                    window.location.hash = "#" + path;
+                    window.dispatchEvent(new HashChangeEvent("hashchange"));
+                    if (window.angular) {
+                        try {
+                            var injector = angular.element(document.body).injector();
+                            if (injector) {
+                                var location = injector.get("$location");
+                                var rootScope = injector.get("$rootScope");
+                                location.path(path);
+                                rootScope.$apply();
+                            }
+                        } catch(e) {
+                            try { angular.element(document.body).scope().$apply(); } catch(e2) {}
+                        }
+                    }
+                }''', hash_path)
             else:
-                # WF 上にいない → フル遷移
-                await page.goto(JOBCAN_WF_BASE + '/' + hash_path, wait_until='domcontentloaded', timeout=30000)
+                # WF 外: page.goto で遷移（中断エラーは無視）
+                try:
+                    await page.goto(JOBCAN_WF_BASE + '/#' + hash_path, wait_until='domcontentloaded', timeout=30000)
+                except Exception:
+                    pass  # SPA の navigation interrupted は正常
         except Exception as e:
             return FillResult(row_num=item.row_num, title=item.title, status='error',
                               filled=0, errors=[f'フォーム遷移失敗: {str(e)[:80]}'],
                               message='フォームを開けません。')
 
-        # AngularJS レンダリング待ち（SPA のルート変更後）
+        # AngularJS レンダリング待ち
         await page.wait_for_timeout(5000)
 
         # フォーム要素の存在確認（リトライ付き）
         fc = 0
-        for retry in range(3):
+        for retry in range(5):
             fc = await page.evaluate('document.querySelectorAll("input,select,textarea").length')
             print(f'[ITEM] attempt {retry+1}: {fc} form elements')
             if fc >= 5:
                 break
+            # リトライ: hash を再設定して AngularJS を再トリガー
+            if retry == 1:
+                await page.evaluate('''(path) => {
+                    window.location.hash = "#/";
+                    setTimeout(function() { window.location.hash = "#" + path; }, 500);
+                    if (window.angular) {
+                        try { angular.element(document.body).scope().$apply(); } catch(e) {}
+                    }
+                }''', hash_path)
             await page.wait_for_timeout(3000)
+
+        if fc < 3:
+            # 最終手段: page.goto でフルリロード
+            print('[ITEM] Fallback: full page.goto')
+            try:
+                await page.goto(JOBCAN_WF_BASE + '/#' + hash_path, wait_until='domcontentloaded', timeout=30000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(5000)
+            fc = await page.evaluate('document.querySelectorAll("input,select,textarea").length')
+            print(f'[ITEM] after fallback: {fc} form elements')
 
         if fc < 3:
             return FillResult(row_num=item.row_num, title=item.title, status='error',
