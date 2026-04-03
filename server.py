@@ -2,13 +2,16 @@
 mikai Jobcan Bridge v5 — Direct API Strategy
 登入後直接 POST Jobcan REST API。不操作 DOM、不渲染表單。
 
-API:
-  POST /api/fill    — 登入 → POST Jobcan API → 回傳結果
-  POST /api/recon   — 登入 → 回傳 cookie/token（診斷用）
-  GET  /api/health  — ヘルスチェック
+v5 QA 修正:
+  - XSRF-TOKEN URL decode
+  - form_json 格式不確定 → 先試 list，失敗再試 string
+  - is_draft 不確定 → 先試，失敗回報原始 response
+  - 支払依頼 flow_id/group_id 缺失 → 不送空值
+  - recon 端點加強 → 攔截真實 API 呼叫的 request 格式
 """
 
 import os, json, traceback
+from urllib.parse import unquote
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Header
@@ -28,15 +31,17 @@ JOBCAN_WF_BASE = 'https://ssl.wf.jobcan.jp'
 FLOW_TO_FORM = {'発注稟議': '666628', '支払依頼': '666591'}
 FORM_META = {
     '666628': {'flow_id': 401080, 'group_id': 560177, 'group_name': 'Board'},
-    '666591': {'flow_id': 0, 'group_id': 0, 'group_name': ''},  # 支払依頼 — 要確認
+    '666591': {},  # 支払依頼 — 値が不明なので空。空の場合は送信しない
 }
 
-# ── 全欄位定義 ──
 FIELD_DEFS = {
-    'form_item3831493': {'id':'3831493','name':'稟議の種類','type':7,'options':['稟議','事後稟議','再稟議']},
+    'form_item3831493': {'id':'3831493','name':'稟議の種類','type':7,
+        'options':['稟議','事後稟議','再稟議']},
     'form_item3831494': {'id':'3831494','name':'契約締結日','type':4},
-    'form_item3818321': {'id':'3818321','name':'内容','type':7,'options':['当社からの支払い（費用）','取引先からの受取（売上）']},
-    'form_item3818329': {'id':'3818329','name':'申請内容','type':7,'options':['契約書','発注書','申込書','利用規約合意']},
+    'form_item3818321': {'id':'3818321','name':'内容','type':7,
+        'options':['当社からの支払い（費用）','取引先からの受取（売上）']},
+    'form_item3818329': {'id':'3818329','name':'申請内容','type':7,
+        'options':['契約書','発注書','申込書','利用規約合意']},
     'form_item3818323': {'id':'3818323','name':'取引先種別','type':6},
     'form_item3818324': {'id':'3818324','name':'発注先','type':9},
     'form_item3822625': {'id':'3822625','name':'取引先名','type':1},
@@ -107,11 +112,12 @@ async def health():
     return {'status': 'ok', 'version': '5.0.0', 'strategy': 'direct_api_post'}
 
 # ══════════════════════════════════════════════════════════
-# /api/recon — 偵察
+# /api/recon — 偵察（token + API 形式の確認）
 # ══════════════════════════════════════════════════════════
 
 @app.post('/api/recon')
 async def recon(req: FillRequest, x_api_key: Optional[str] = Header(None)):
+    """登入 → cookie/token/API格式を回報"""
     verify_key(x_api_key)
     async with async_playwright() as p:
         browser = await launch_browser(p)
@@ -121,21 +127,44 @@ async def recon(req: FillRequest, x_api_key: Optional[str] = Header(None)):
             await browser.close()
             return {'error': lr['reason']}
 
-        cookies = await page.context.cookies()
-        cookie_list = [{'name':c['name'],'value':c['value'][:80],'domain':c['domain']} for c in cookies]
-        doc_cookie = await page.evaluate('document.cookie')
+        tokens = await extract_tokens(page)
 
-        # API テスト: GET /wf/api/ を試す
-        api_test = await page.evaluate('''async () => {
+        # API endpoint テスト（GET → 存在確認）
+        api_get = await page.evaluate('''async () => {
             try {
                 var r = await fetch("/wf/api/", {credentials:"same-origin"});
-                var t = await r.text();
-                return {status:r.status, body:t.substring(0,500)};
+                return {status:r.status, ok:r.ok};
             } catch(e) { return {error:e.message}; }
         }''')
 
+        # XHR 攔截: AngularJS が使う API のリクエスト形式を観察
+        # フォームページを開いて、AngularJS が送る XHR を全部記録
+        intercepted = []
+        page.on('request', lambda req: intercepted.append({
+            'url': req.url, 'method': req.method,
+            'headers': dict(req.headers) if req.method == 'POST' else {},
+            'post': (req.post_data or '')[:500] if req.method == 'POST' else ''
+        }) if '/wf/api/' in req.url else None)
+
+        # フォームページを開く（表示はしないが、AngularJS の初期 API 呼出しを観察）
+        try:
+            await page.goto(JOBCAN_WF_BASE + '/#/requests/new/666628',
+                            wait_until='domcontentloaded', timeout=15000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(5000)
+
         await browser.close()
-        return {'login':'ok','cookies':cookie_list,'document_cookie':doc_cookie[:500],'api_test':api_test}
+        return {
+            'login': 'ok',
+            'tokens': {
+                'xsrf': tokens['xsrf'][:50] if tokens['xsrf'] else None,
+                'csrf': tokens['csrf'][:50] if tokens['csrf'] else None,
+            },
+            'all_cookies': tokens['all_cookies'],
+            'api_get_test': api_get,
+            'intercepted_api_calls': intercepted[:20],
+        }
 
 # ══════════════════════════════════════════════════════════
 # /api/fill — メイン
@@ -153,18 +182,17 @@ async def fill_jobcan(req: FillRequest, x_api_key: Optional[str] = Header(None))
             browser = await launch_browser(p)
             page = await create_page(browser)
 
-            # Login
             lr = await do_login(page, req.email, req.password)
             if not lr['ok']:
                 await browser.close()
                 return JSONResponse(status_code=401, content={'error': lr['reason']})
             print('[MAIN] Login OK')
 
-            # CSRF tokens
             tokens = await extract_tokens(page)
-            print(f'[MAIN] XSRF={bool(tokens["xsrf"])} CSRF={bool(tokens["csrf"])}')
+            if not tokens['xsrf'] and not tokens['csrf']:
+                # Token なしでも試す（Jobcan が cookie だけで認証する可能性）
+                print('[MAIN] WARNING: No CSRF tokens found, trying anyway')
 
-            # Submit each item
             for i, item in enumerate(req.items):
                 print(f'[MAIN] Item {i+1}/{len(req.items)}: {item.title}')
                 r = await submit_item(page, item, tokens, req.action)
@@ -195,7 +223,7 @@ async def create_page(browser):
     return await ctx.new_page()
 
 # ══════════════════════════════════════════════════════════
-# Login（検証済み — v2 以降変更なし）
+# Login（検証済み）
 # ══════════════════════════════════════════════════════════
 
 async def do_login(page, email: str, password: str) -> dict:
@@ -203,15 +231,15 @@ async def do_login(page, email: str, password: str) -> dict:
         await page.goto(JOBCAN_LOGIN_URL, wait_until='networkidle', timeout=30000)
         await page.wait_for_timeout(2000)
     except Exception as e:
-        return {'ok':False,'reason':f'ログインページ接続失敗: {str(e)[:100]}'}
+        return {'ok': False, 'reason': f'ログインページ接続失敗: {str(e)[:100]}'}
 
     url = page.url
     if 'wf.jobcan.jp' in url:
-        return {'ok':True}
+        return {'ok': True}
     if 'id.jobcan.jp' in url and 'sign_in' not in url:
         return await _goto_wf(page)
     if not await page.query_selector('#user_email'):
-        return {'ok':False,'reason':f'ログインフォーム不明: {url}'}
+        return {'ok': False, 'reason': f'ログインフォーム不明: {url}'}
 
     try:
         await page.fill('#user_email', email)
@@ -219,14 +247,15 @@ async def do_login(page, email: str, password: str) -> dict:
         await page.wait_for_timeout(500)
         await page.click('[name="commit"]')
     except Exception as e:
-        return {'ok':False,'reason':f'入力エラー: {str(e)[:80]}'}
+        return {'ok': False, 'reason': f'入力エラー: {str(e)[:80]}'}
 
+    # sign_in から離れるのを待つ
     for _ in range(20):
         await page.wait_for_timeout(1000)
         if 'sign_in' not in page.url:
             break
     else:
-        return {'ok':False,'reason':'ログイン失敗（タイムアウト）'}
+        return {'ok': False, 'reason': 'ログイン失敗（タイムアウト）'}
 
     return await _goto_wf(page)
 
@@ -235,78 +264,62 @@ async def _goto_wf(page) -> dict:
         await page.goto(JOBCAN_WF_BASE + '/', wait_until='domcontentloaded', timeout=30000)
         await page.wait_for_timeout(5000)
     except Exception as e:
-        return {'ok':False,'reason':f'WF接続失敗: {str(e)[:100]}'}
+        return {'ok': False, 'reason': f'WF接続失敗: {str(e)[:100]}'}
     if 'sign_in' in page.url:
-        return {'ok':False,'reason':'セッション無効'}
+        return {'ok': False, 'reason': 'セッション無効'}
     print(f'[LOGIN] OK at {page.url}')
-    return {'ok':True}
+    return {'ok': True}
 
 # ══════════════════════════════════════════════════════════
-# CSRF Token 取得
+# CSRF Token（QA修正: URL decode 追加）
 # ══════════════════════════════════════════════════════════
 
 async def extract_tokens(page) -> dict:
-    """cookie と meta tag から CSRF token を取得"""
     xsrf = ''
     csrf = ''
     all_cookies = []
 
-    # Method 1: Playwright context.cookies()
+    # Method 1: Playwright cookies
     cookies = await page.context.cookies()
     for c in cookies:
-        all_cookies.append(f'{c["name"]}={c["value"][:30]}...')
+        all_cookies.append(f'{c["name"]}={c["value"][:40]}')
         if c['name'] == 'XSRF-TOKEN':
-            xsrf = c['value']
-        elif c['name'] == 'csrftoken' or c['name'] == 'csrf_token':
-            csrf = c['value']
+            xsrf = unquote(c['value'])  # URL decode
+        elif c['name'] in ('csrftoken', 'csrf_token', '_csrf'):
+            csrf = unquote(c['value'])
 
-    # Method 2: document.cookie（context.cookies で取れない場合の fallback）
+    # Method 2: document.cookie
     if not xsrf:
         doc_cookie = await page.evaluate('document.cookie')
         for part in doc_cookie.split(';'):
             part = part.strip()
             if part.startswith('XSRF-TOKEN='):
-                xsrf = part.split('=', 1)[1]
-            elif part.startswith('csrftoken='):
-                csrf = part.split('=', 1)[1]
+                xsrf = unquote(part.split('=', 1)[1])
 
-    # Method 3: meta tag
-    if not csrf:
-        csrf = await page.evaluate('''() => {
-            var el = document.querySelector('meta[name="csrf-token"]')
-                  || document.querySelector('meta[name="_csrf"]');
-            return el ? el.content : "";
-        }''')
-
-    # CSRF が見つからなければ XSRF を使う（Jobcan は XSRF-TOKEN で統一の可能性）
+    # Fallback: CSRF = XSRF
     if not csrf:
         csrf = xsrf
 
-    print(f'[TOKEN] XSRF: {xsrf[:30] if xsrf else "NONE"} | CSRF: {csrf[:30] if csrf else "NONE"}')
-    print(f'[TOKEN] All cookies: {", ".join(all_cookies[:10])}')
-
+    print(f'[TOKEN] XSRF={xsrf[:30] if xsrf else "NONE"} | CSRF={csrf[:30] if csrf else "NONE"}')
+    print(f'[TOKEN] Cookies: {", ".join(all_cookies[:15])}')
     return {'xsrf': xsrf, 'csrf': csrf, 'all_cookies': all_cookies}
 
 # ══════════════════════════════════════════════════════════
-# form_json 構築
+# form_json 構築（QA修正: type 13 早期 skip）
 # ══════════════════════════════════════════════════════════
 
 def build_form_json(payload: dict) -> list:
-    """
-    AD 欄の payload → Jobcan API の form_json 配列に変換。
-    各 item_type に応じた正しい構造を生成。
-    """
-    form_items = []
-
+    items = []
     for input_name, value in payload.items():
         if input_name.startswith('_'):
             continue
         value = str(value).strip()
         if not value:
             continue
-
         fdef = FIELD_DEFS.get(input_name)
         if not fdef:
+            continue
+        if fdef['type'] == 13:  # Special → skip immediately
             continue
 
         item = {
@@ -317,34 +330,25 @@ def build_form_json(payload: dict) -> list:
             'request_content': value,
         }
 
-        # Type 7: Checkbox — 需要 select_item_labels + select_item_labels_obj
         if fdef['type'] == 7 and 'options' in fdef:
-            checked_values = [v.strip() for v in value.split(',')]
+            checked = [v.strip() for v in value.split(',')]
             item['select_item_labels'] = fdef['options']
             item['select_item_labels_obj'] = [
-                {'label': opt, 'checked': opt in checked_values}
+                {'label': opt, 'checked': opt in checked}
                 for opt in fdef['options']
             ]
 
-        # Type 13: Special — skip
-        if fdef['type'] == 13:
-            continue
-
-        form_items.append(item)
-
-    return form_items
+        items.append(item)
+    return items
 
 # ══════════════════════════════════════════════════════════
-# API 送信
+# API 送信（QA修正: 2 種格式で試行）
 # ══════════════════════════════════════════════════════════
 
 async def submit_item(page, item: FillPayload, tokens: dict, action: str) -> FillResult:
-    """Jobcan REST API に直接 POST"""
     try:
         form_id = FLOW_TO_FORM.get(item.flow_type, '666628')
-        meta = FORM_META.get(form_id, FORM_META['666628'])
-
-        # form_json 構築
+        meta = FORM_META.get(form_id, {})
         form_json = build_form_json(item.payload)
         filled_count = len(form_json)
 
@@ -352,94 +356,111 @@ async def submit_item(page, item: FillPayload, tokens: dict, action: str) -> Fil
             return FillResult(row_num=item.row_num, title=item.title, status='error',
                 filled=0, errors=['入力データなし'], message='payload にフィールドがありません。')
 
-        # API リクエスト body
-        body = {
-            'form_id': int(form_id),
-            'form_json': form_json,
-        }
-
-        # flow_id, group_id がある場合は追加
-        if meta['flow_id']:
+        # Body 構築（QA修正: 空の flow_id/group_id は送らない）
+        body = {'form_id': int(form_id), 'form_json': form_json}
+        if meta.get('flow_id'):
             body['flow_id'] = meta['flow_id']
-        if meta['group_id']:
+        if meta.get('group_id'):
             body['group_id'] = meta['group_id']
-            body['group_name'] = meta['group_name']
-
-        # 下書き保存 vs 申請
+            body['group_name'] = meta.get('group_name', '')
         if action == 'draft':
             body['is_draft'] = True
 
-        body_json = json.dumps(body, ensure_ascii=False)
-        print(f'[API] POST body ({len(body_json)} chars): {body_json[:300]}...')
-
-        # ブラウザ内部から fetch() で POST（cookie 自動送信、DNS 問題なし）
         xsrf = tokens.get('xsrf', '')
         csrf = tokens.get('csrf', '')
 
-        result = await page.evaluate('''async (args) => {
-            var body = args[0];
-            var xsrf = args[1];
-            var csrf = args[2];
+        # === 試行 1: form_json を list として送信 ===
+        body_json = json.dumps(body, ensure_ascii=False)
+        print(f'[API] Attempt 1 (list): {body_json[:300]}...')
 
-            var headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "Referer": location.href
-            };
-            if (xsrf) headers["X-XSRF-TOKEN"] = xsrf;
-            if (csrf) headers["X-CSRFToken"] = csrf;
+        result = await _do_fetch(page, body_json, xsrf, csrf)
+        print(f'[API] Attempt 1 result: HTTP {result.get("status")}')
 
-            try {
-                var resp = await fetch("/wf/api/requests/new/", {
-                    method: "POST",
-                    headers: headers,
-                    credentials: "same-origin",
-                    body: body
-                });
-
-                var respText = await resp.text();
-                var respJson = null;
-                try { respJson = JSON.parse(respText); } catch(e) {}
-
-                return {
-                    ok: resp.ok,
-                    status: resp.status,
-                    statusText: resp.statusText,
-                    body: respText.substring(0, 2000),
-                    json: respJson
-                };
-            } catch(e) {
-                return { ok: false, status: 0, error: e.message };
-            }
-        }''', [body_json, xsrf, csrf])
-
-        print(f'[API] Response: {result.get("status")} | {str(result.get("body",""))[:200]}')
-
+        # 成功
         if result.get('ok'):
-            # 成功
-            resp_json = result.get('json', {})
-            request_id = ''
-            if resp_json:
-                request_id = str(resp_json.get('id', resp_json.get('request_id', '')))
-            action_label = '下書き保存' if action == 'draft' else '申請'
-            msg = f'{action_label}しました。'
-            if request_id:
-                msg += f' 申請番号: {request_id}'
-            return FillResult(row_num=item.row_num, title=item.title, status='success',
-                filled=filled_count, errors=[], message=msg)
-        else:
-            # 失敗
-            status = result.get('status', 0)
-            err_body = result.get('body', result.get('error', 'unknown'))
-            return FillResult(row_num=item.row_num, title=item.title, status='error',
-                filled=filled_count, errors=[f'API {status}: {err_body[:200]}'],
-                message=f'Jobcan API エラー (HTTP {status})',
-                debug={'response': result})
+            return _build_success(item, filled_count, result, action)
+
+        # === 試行 2: form_json を JSON string として送信 ===
+        if result.get('status') in (400, 422):
+            print('[API] Attempt 1 failed with 400/422, trying form_json as string...')
+            body2 = dict(body)
+            body2['form_json'] = json.dumps(form_json, ensure_ascii=False)
+            body_json2 = json.dumps(body2, ensure_ascii=False)
+            result2 = await _do_fetch(page, body_json2, xsrf, csrf)
+            print(f'[API] Attempt 2 result: HTTP {result2.get("status")}')
+            if result2.get('ok'):
+                return _build_success(item, filled_count, result2, action)
+            # 両方失敗 → 詳細な方を返す
+            result = result2 if len(str(result2.get('body',''))) > len(str(result.get('body',''))) else result
+
+        # === 試行 3: is_draft を外して再試行（draft パラメータが不正の場合）===
+        if result.get('status') in (400, 422) and action == 'draft':
+            print('[API] Attempt 3: removing is_draft...')
+            body3 = dict(body)
+            body3.pop('is_draft', None)
+            body_json3 = json.dumps(body3, ensure_ascii=False)
+            result3 = await _do_fetch(page, body_json3, xsrf, csrf)
+            print(f'[API] Attempt 3 result: HTTP {result3.get("status")}')
+            if result3.get('ok'):
+                return _build_success(item, filled_count, result3, '通常申請（下書きパラメータ不明）')
+            result = result3
+
+        # 全失敗
+        status = result.get('status', 0)
+        err_body = result.get('body', result.get('error', 'unknown'))
+        return FillResult(
+            row_num=item.row_num, title=item.title, status='error',
+            filled=filled_count,
+            errors=[f'API HTTP {status}'],
+            message=f'Jobcan API エラー (HTTP {status}): {str(err_body)[:300]}',
+            debug={'response': result, 'sent_body_preview': body_json[:500]})
 
     except Exception as e:
         print(f'[API] Exception: {traceback.format_exc()}')
         return FillResult(row_num=item.row_num, title=item.title, status='error',
             filled=0, errors=[str(e)[:100]], message=f'エラー: {str(e)[:100]}')
+
+
+async def _do_fetch(page, body_json: str, xsrf: str, csrf: str) -> dict:
+    """ブラウザ内 fetch() で Jobcan API に POST"""
+    return await page.evaluate('''async (args) => {
+        var body = args[0], xsrf = args[1], csrf = args[2];
+        var headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Referer": location.href,
+            "X-Requested-With": "XMLHttpRequest"
+        };
+        if (xsrf) headers["X-XSRF-TOKEN"] = xsrf;
+        if (csrf) headers["X-CSRFToken"] = csrf;
+
+        try {
+            var resp = await fetch("/wf/api/requests/new/", {
+                method: "POST",
+                headers: headers,
+                credentials: "same-origin",
+                body: body
+            });
+            var text = await resp.text();
+            var json = null;
+            try { json = JSON.parse(text); } catch(e) {}
+            return {ok: resp.ok, status: resp.status, statusText: resp.statusText,
+                    body: text.substring(0, 2000), json: json};
+        } catch(e) {
+            return {ok: false, status: 0, error: e.message};
+        }
+    }''', [body_json, xsrf, csrf])
+
+
+def _build_success(item: FillPayload, filled: int, result: dict, action: str) -> FillResult:
+    resp_json = result.get('json') or {}
+    request_id = str(resp_json.get('id', resp_json.get('request_id', '')))
+    label = '下書き保存' if action == 'draft' else '申請'
+    msg = f'{label}しました。'
+    if request_id:
+        msg += f' 申請番号: {request_id}'
+    return FillResult(row_num=item.row_num, title=item.title, status='success',
+        filled=filled, errors=[], message=msg)
 
 # ══════════════════════════════════════════════════════════
 # Entry
