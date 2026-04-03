@@ -70,9 +70,60 @@ FIELD_DEFS = {
     'form_item3818341': {'id':'3818341','name':'支払手段','type':6},
 }
 
-# ══════════════════════════════════════════════════════════
-# Models
-# ══════════════════════════════════════════════════════════
+# ── AD 欄 alias key → form_item ID 對照 ──────────────
+# AD 欄 JSON 使用語意化 key（如 vendor_name），需要轉成 form_item ID
+ALIAS_MAP = {
+    # 共通
+    'vendor_name':        'form_item3822625',  # 取引先名
+    'vendor_type':        'form_item3818323',  # 取引先種別
+    'amount':             'form_item3818325',  # 発注額
+    'settlement_method':  'form_item3818341',  # 支払手段
+    'recording_date':     'form_item3831494',  # 契約締結日
+    'content':            'form_item3831524',  # 契約書名・目的
+    'detail_content':     'form_item3831524',  # 契約書名・目的（別名）
+    'website':            'form_item3818337',  # 取引先ウェブサイト
+    'bank_info':          'form_item3841064',  # 銀行情報
+    'tax_status':         'form_item3841065',  # 課税事業者情報
+    'tax_number':         'form_item3841066',  # 課税事業者番号
+    'project_name':       'form_item3831525',  # プロジェクト名
+    'budget_method':      'form_item4143713',  # 予算稟議の方法
+    'budget_note':        'form_item3818328',  # 予算関連備考
+    'amount_range':       'form_item3869371',  # 金額の範囲
+    'payment_cycle':      'form_item3818340',  # 支払サイクル
+    'antisocial_check':   'form_item3818330',  # 反社チェック
+    'stock_number':       'form_item3818331',  # 証券番号
+    'antisocial_number':  'form_item3818332',  # 反社チェック完了番号
+    'nda_status':         'form_item3831551',  # 秘密保持契約書
+    'basic_agreement':    'form_item3831552',  # 取引基本契約書
+    'competing_quotes':   'form_item3822626',  # 相見積もり
+    'contract_method':    'form_item3818338',  # 締結方法
+    'legal_check':        'form_item3831553',  # リーガルチェック
+    'legal_check_url':    'form_item3818339',  # リーガルチェックURL
+    # Toba alias keys
+    'ringi_type':         'form_item3831493',  # 稟議の種類
+    'order_amount':       'form_item3818325',  # 発注額
+    'vendor_status':      'form_item3818323',  # 取引先種別
+}
+
+# 日付フォーマット変換
+def normalize_date(value: str) -> str:
+    """JS Date string や各種形式を YYYY/MM/DD に変換"""
+    import re
+    v = value.strip()
+    if not v:
+        return ''
+    # 既に YYYY/MM/DD or YYYY-MM-DD
+    m = re.match(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', v)
+    if m:
+        return f'{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}'
+    # JS Date string: "Tue Mar 31 2026 15:00:00 GMT+0800 ..."
+    months = {'Jan':'01','Feb':'02','Mar':'03','Apr':'04','May':'05','Jun':'06',
+              'Jul':'07','Aug':'08','Sep':'09','Oct':'10','Nov':'11','Dec':'12'}
+    m2 = re.match(r'\w+ (\w+) (\d+) (\d{4})', v)
+    if m2 and m2.group(1) in months:
+        return f'{m2.group(3)}/{months[m2.group(1)]}/{int(m2.group(2)):02d}'
+    # そのまま返す
+    return v
 
 class FillPayload(BaseModel):
     payload: dict
@@ -309,18 +360,43 @@ async def extract_tokens(page) -> dict:
 # ══════════════════════════════════════════════════════════
 
 def build_form_json(payload: dict) -> list:
+    """
+    AD 欄 payload → Jobcan form_json。
+    支援兩種 key 格式:
+      1. form_itemXXXXXXX（直接對應）
+      2. 語意化 alias（vendor_name 等，透過 ALIAS_MAP 轉換）
+    """
     items = []
-    for input_name, value in payload.items():
-        if input_name.startswith('_'):
+    seen_ids = set()  # 重複防止
+
+    for raw_key, value in payload.items():
+        if raw_key.startswith('_'):
             continue
         value = str(value).strip()
         if not value:
             continue
+
+        # key 解決: alias → form_item ID
+        if raw_key.startswith('form_item'):
+            input_name = raw_key
+        elif raw_key in ALIAS_MAP:
+            input_name = ALIAS_MAP[raw_key]
+        else:
+            # 未知の key → スキップ（title, currency 等のメタ情報）
+            continue
+
         fdef = FIELD_DEFS.get(input_name)
         if not fdef:
             continue
-        if fdef['type'] == 13:  # Special → skip immediately
+        if fdef['type'] == 13:
             continue
+        if fdef['id'] in seen_ids:
+            continue  # 同じフィールドの重複を防止
+        seen_ids.add(fdef['id'])
+
+        # 日付フォーマット変換
+        if fdef['type'] == 4:
+            value = normalize_date(value)
 
         item = {
             'id': int(fdef['id']),
@@ -339,6 +415,7 @@ def build_form_json(payload: dict) -> list:
             ]
 
         items.append(item)
+
     return items
 
 # ══════════════════════════════════════════════════════════
@@ -352,6 +429,15 @@ async def submit_item(page, item: FillPayload, tokens: dict, action: str) -> Fil
         form_json = build_form_json(item.payload)
         filled_count = len(form_json)
 
+        # 診断ログ: 受信した key と変換結果
+        payload_keys = [k for k in item.payload.keys() if not k.startswith('_')]
+        mapped_keys = [it['input_name'] for it in form_json]
+        skipped_keys = [k for k in payload_keys if k not in ALIAS_MAP and not k.startswith('form_item')]
+        print(f'[API] Payload keys: {payload_keys}')
+        print(f'[API] Mapped to: {mapped_keys}')
+        if skipped_keys:
+            print(f'[API] Skipped (no mapping): {skipped_keys}')
+
         if filled_count == 0:
             return FillResult(row_num=item.row_num, title=item.title, status='error',
                 filled=0, errors=['入力データなし'], message='payload にフィールドがありません。')
@@ -363,6 +449,10 @@ async def submit_item(page, item: FillPayload, tokens: dict, action: str) -> Fil
         if meta.get('group_id'):
             body['group_id'] = meta['group_id']
             body['group_name'] = meta.get('group_name', '')
+        # title があれば追加（申請タイトル）
+        title = item.payload.get('title', '') or item.title
+        if title:
+            body['title'] = title
         if action == 'draft':
             body['is_draft'] = True
 
