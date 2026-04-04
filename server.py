@@ -563,12 +563,13 @@ async def submit_item(page, item: FillPayload, tokens: dict, action: str) -> Fil
 
 async def _do_fetch(page, body_json: str, xsrf: str, csrf: str) -> dict:
     """ブラウザ内 fetch() で Jobcan API に POST — 複数パスを試行"""
-    # 複数の API パスを試す（ssl.wf.jobcan.jp のパス構造が不明）
+    # recon 結果: 真實 API は /api/v1/ 配下
+    # XHR: /api/v1/forms/, /api/v1/users/, /api/v1/cloudsign/
     paths = [
-        '/wf/api/requests/new/',
-        '/api/requests/new/',
-        '/wf/api/v1/requests/new/',
-        '/api/v1/requests/new/',
+        '/api/v1/requests/',         # 最有力（recon で /api/v1/ が確認済み）
+        '/api/v1/requests/new/',     # new 付き
+        '/api/v1/request/create/',   # create パターン
+        '/wf/api/requests/new/',     # 旧パス（念のため）
     ]
 
     return await page.evaluate('''async (args) => {
