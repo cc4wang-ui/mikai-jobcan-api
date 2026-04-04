@@ -160,7 +160,44 @@ def verify_key(x_api_key: Optional[str] = Header(None)):
 
 @app.get('/api/health')
 async def health():
-    return {'status': 'ok', 'version': '5.0.0', 'strategy': 'direct_api_post'}
+    return {'status': 'ok', 'version': '5.1.0', 'strategy': 'direct_api_post'}
+
+# ══════════════════════════════════════════════════════════
+# /api/form-info — 取得 Jobcan form 定義（最重要的診斷）
+# ══════════════════════════════════════════════════════════
+
+@app.post('/api/form-info')
+async def form_info(req: FillRequest, x_api_key: Optional[str] = Header(None)):
+    """登入 → /api/v1/forms/{id}/ を取得して返す"""
+    verify_key(x_api_key)
+    async with async_playwright() as p:
+        browser = await launch_browser(p)
+        page = await create_page(browser)
+        lr = await do_login(page, req.email, req.password)
+        if not lr['ok']:
+            await browser.close()
+            return {'error': lr['reason']}
+
+        # 両方のフォーム定義を取得
+        result = await page.evaluate('''async () => {
+            var out = {};
+            var ids = ["666628", "666591"];
+            for (var i = 0; i < ids.length; i++) {
+                try {
+                    var r = await fetch("/api/v1/forms/" + ids[i] + "/?request_user_id=1111126",
+                                        {credentials: "same-origin"});
+                    var text = await r.text();
+                    try { out[ids[i]] = {status: r.status, data: JSON.parse(text)}; }
+                    catch(e) { out[ids[i]] = {status: r.status, raw: text.substring(0, 5000)}; }
+                } catch(e) {
+                    out[ids[i]] = {error: e.message};
+                }
+            }
+            return out;
+        }''')
+
+        await browser.close()
+        return result
 
 # ══════════════════════════════════════════════════════════
 # /api/recon — 偵察（token + API 路徑發現）
