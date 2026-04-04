@@ -1,0 +1,78 @@
+﻿{
+    "results":  [
+                    {
+                        "row":  0,
+                        "status":  "diagnosing",
+                        "attempts":  [
+                                         {
+                                             "v":  "V1:base",
+                                             "http":  400,
+                                             "resp":  {
+                                                          "error_message":  [
+                                                                                "éä¿¡ããããã¼ã¿ãä¸é©åã§ããå¦çã§ãã¾ããã§ããã"
+                                                                            ]
+                                                      }
+                                         },
+                                         {
+                                             "v":  "V2:rdj_str",
+                                             "http":  400,
+                                             "resp":  {
+                                                          "error_message":  [
+                                                                                "éä¿¡ããããã¼ã¿ãä¸é©åã§ããå¦çã§ãã¾ããã§ããã"
+                                                                            ]
+                                                      }
+                                         },
+                                         {
+                                             "v":  "V3:no_rdj",
+                                             "http":  400,
+                                             "resp":  {
+                                                          "error_message":  [
+                                                                                "éä¿¡ããããã¼ã¿ãä¸é©åã§ããå¦çã§ãã¾ããã§ããã"
+                                                                            ]
+                                                      }
+                                         },
+                                         {
+                                             "v":  "V4:+flow_id",
+                                             "http":  400,
+                                             "resp":  {
+                                                          "error_message":  [
+                                                                                "éä¿¡ããããã¼ã¿ãä¸é©åã§ããå¦çã§ãã¾ããã§ããã"
+                                                                            ]
+                                                      }
+                                         },
+                                         {
+                                             "v":  "V5:+req_files",
+                                             "http":  400,
+                                             "resp":  {
+                                                          "error_message":  [
+                                                                                "éä¿¡ããããã¼ã¿ãä¸é©åã§ããå¦çã§ãã¾ããã§ããã"
+                                                                            ]
+                                                      }
+                                         },
+                                         {
+                                             "v":  "V6:fd_str",
+                                             "http":  400,
+                                             "resp":  {
+                                                          "error_message":  [
+                                                                                "éä¿¡ããããã¼ã¿ãä¸é©åã§ããå¦çã§ãã¾ããã§ããã"
+                                                                            ]
+                                                      }
+                                         },
+                                         {
+                                             "v":  "V7:combined",
+                                             "http":  400,
+                                             "resp":  {
+                                                          "error_message":  [
+                                                                                "éä¿¡ããããã¼ã¿ãä¸é©åã§ããå¦çã§ãã¾ããã§ããã"
+                                                                            ]
+                                                      }
+                                         },
+                                         {
+                                             "v":  "V8:ultra_min",
+                                             "http":  500,
+                                             "resp":  "\u003c!DOCTYPE html\u003e\n\u003chtml\u003e\n\u003chead\u003e\n  \u003cmeta charset=\"UTF-8\"\u003e\n  \u003cmeta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\"\u003e\n  \u003ctitle\u003e500\u003c/title\u003e\n  \u003cmeta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"\u003e\n\n  \u003cstyle type=\"text/css\" media=\"screen\"\u003e\n    *,\n    *:before,\n    *:after {\n      -webkit-box-sizing: border-box;\n      box-sizing: border-box;\n      margin: 0;\n      padding: 0;\n    }\n\n    body {\n      position: relative;\n      width: auto;\n      min-width: 100%;\n      backgro"
+                                         }
+                                     ]
+                    }
+                ]
+}
