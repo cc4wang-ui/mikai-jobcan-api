@@ -1,690 +1,722 @@
 """
-mikai Jobcan Bridge v5 — Direct API Strategy
-登入後直接 POST Jobcan REST API。不操作 DOM、不渲染表單。
+mikai Jobcan Bridge — v6.0.0
+Phase B Railway Backend
 
-v5 QA 修正:
-  - XSRF-TOKEN URL decode
-  - form_json 格式不確定 → 先試 list，失敗再試 string
-  - is_draft 不確定 → 先試，失敗回報原始 response
-  - 支払依頼 flow_id/group_id 缺失 → 不送空值
-  - recon 端點加強 → 攔截真實 API 呼叫的 request 格式
+v6 重點: 
+- /api/recon-js: 抓 Jobcan 的 AngularJS 應用 JS，反推 submission body 格式
+- /api/fill: 系統性嘗試多種 body 格式（一次跑完全部 pattern）
 """
 
-import os, json, traceback
-from urllib.parse import unquote
-from typing import List, Optional
-
+import json
+import re
+import asyncio
+import time
+import os
+import traceback
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from playwright.async_api import async_playwright
+from typing import Optional
+from playwright.async_api import async_playwright, Browser, BrowserContext
 
-# ══════════════════════════════════════════════════════════
-# 設定
-# ══════════════════════════════════════════════════════════
+# ── Config ──────────────────────────────────────────────
+API_KEY = os.getenv("API_KEY", "mikai-prod-2026")
+PORT = int(os.getenv("PORT", "8080"))
+VERSION = "6.0.0"
 
-API_KEY = os.environ.get('API_KEY', 'mikai-dev-key-change-me')
-JOBCAN_LOGIN_URL = 'https://id.jobcan.jp/users/sign_in'
-JOBCAN_WF_BASE = 'https://ssl.wf.jobcan.jp'
+JOBCAN_LOGIN_URL = "https://id.jobcan.jp/users/sign_in"
+JOBCAN_WF_BASE = "https://ssl.wf.jobcan.jp"
 
-FLOW_TO_FORM = {'発注稟議': '666628', '支払依頼': '666591'}
-FORM_META = {
-    '666628': {'flow_id': 401080, 'group_id': 560177, 'group_name': 'Board'},
-    '666591': {},  # 支払依頼 — 値が不明なので空。空の場合は送信しない
+# 發注稟議 form definition (from recon 2026-04-04)
+FORM_666628 = {
+    "form_id": 666628,
+    "flow_id": 401080,
+    "flow_id_high": 401084,  # >=500万
+    "form_type": 1,
+    "client": 53786,
+    "group_id": 560177,
+    "group_name": "Board",
 }
 
-FIELD_DEFS = {
-    'form_item3831493': {'id':'3831493','name':'稟議の種類','type':7,
-        'options':['稟議','事後稟議','再稟議']},
-    'form_item3831494': {'id':'3831494','name':'契約締結日','type':4},
-    'form_item3818321': {'id':'3818321','name':'内容','type':7,
-        'options':['当社からの支払い（費用）','取引先からの受取（売上）']},
-    'form_item3818329': {'id':'3818329','name':'申請内容','type':7,
-        'options':['契約書','発注書','申込書','利用規約合意']},
-    'form_item3818323': {'id':'3818323','name':'取引先種別','type':6},
-    'form_item3818324': {'id':'3818324','name':'発注先','type':9},
-    'form_item3822625': {'id':'3822625','name':'取引先名','type':1},
-    'form_item3818337': {'id':'3818337','name':'取引先ウェブサイト','type':1},
-    'form_item3841064': {'id':'3841064','name':'銀行情報','type':2},
-    'form_item3841065': {'id':'3841065','name':'課税事業者情報','type':6},
-    'form_item3841066': {'id':'3841066','name':'課税事業者番号','type':1},
-    'form_item3831525': {'id':'3831525','name':'プロジェクトまたは予算項目名','type':1},
-    'form_item3831524': {'id':'3831524','name':'契約書名・目的','type':2},
-    'form_item4143713': {'id':'4143713','name':'予算稟議の方法','type':6},
-    'form_item3818322': {'id':'3818322','name':'予算申請','type':13},
-    'form_item4143714': {'id':'4143714','name':'複数予算申請記載欄','type':2},
-    'form_item3818328': {'id':'3818328','name':'予算関連備考','type':2},
-    'form_item3869371': {'id':'3869371','name':'金額の範囲','type':6},
-    'form_item3818325': {'id':'3818325','name':'発注額','type':3},
-    'form_item3818340': {'id':'3818340','name':'支払サイクル','type':6},
-    'form_item3818330': {'id':'3818330','name':'反社チェック','type':5},
-    'form_item3818331': {'id':'3818331','name':'証券番号','type':1},
-    'form_item3818332': {'id':'3818332','name':'反社チェック完了番号','type':1},
-    'form_item3831551': {'id':'3831551','name':'秘密保持経書の締結','type':6},
-    'form_item3831552': {'id':'3831552','name':'取引基本契約書','type':6},
-    'form_item3822626': {'id':'3822626','name':'相見積もり','type':5},
-    'form_item3818338': {'id':'3818338','name':'締結方法','type':5},
-    'form_item3831553': {'id':'3831553','name':'リーガルチェック','type':5},
-    'form_item3818339': {'id':'3818339','name':'リーガルチェックURL','type':1},
-    'form_item3818341': {'id':'3818341','name':'支払手段','type':6},
-}
+# ── Playwright singleton ────────────────────────────────
+_browser: Optional[Browser] = None
 
-# ── AD 欄 alias key → form_item ID 對照 ──────────────
-# AD 欄 JSON 使用語意化 key（如 vendor_name），需要轉成 form_item ID
-ALIAS_MAP = {
-    # 共通
-    'vendor_name':        'form_item3822625',  # 取引先名
-    'vendor_type':        'form_item3818323',  # 取引先種別
-    'amount':             'form_item3818325',  # 発注額
-    'settlement_method':  'form_item3818341',  # 支払手段
-    'recording_date':     'form_item3831494',  # 契約締結日
-    'content':            'form_item3831524',  # 契約書名・目的
-    'detail_content':     'form_item3831524',  # 契約書名・目的（別名）
-    'website':            'form_item3818337',  # 取引先ウェブサイト
-    'bank_info':          'form_item3841064',  # 銀行情報
-    'tax_status':         'form_item3841065',  # 課税事業者情報
-    'tax_number':         'form_item3841066',  # 課税事業者番号
-    'project_name':       'form_item3831525',  # プロジェクト名
-    'budget_method':      'form_item4143713',  # 予算稟議の方法
-    'budget_note':        'form_item3818328',  # 予算関連備考
-    'amount_range':       'form_item3869371',  # 金額の範囲
-    'payment_cycle':      'form_item3818340',  # 支払サイクル
-    'antisocial_check':   'form_item3818330',  # 反社チェック
-    'stock_number':       'form_item3818331',  # 証券番号
-    'antisocial_number':  'form_item3818332',  # 反社チェック完了番号
-    'nda_status':         'form_item3831551',  # 秘密保持契約書
-    'basic_agreement':    'form_item3831552',  # 取引基本契約書
-    'competing_quotes':   'form_item3822626',  # 相見積もり
-    'contract_method':    'form_item3818338',  # 締結方法
-    'legal_check':        'form_item3831553',  # リーガルチェック
-    'legal_check_url':    'form_item3818339',  # リーガルチェックURL
-    # Toba alias keys
-    'ringi_type':         'form_item3831493',  # 稟議の種類
-    'order_amount':       'form_item3818325',  # 発注額
-    'vendor_status':      'form_item3818323',  # 取引先種別
-}
+async def get_browser() -> Browser:
+    global _browser
+    if _browser is None or not _browser.is_connected():
+        pw = await async_playwright().start()
+        _browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-gpu',
+                '--disable-dev-shm-usage',
+            ]
+        )
+    return _browser
 
-# 日付フォーマット変換
-def normalize_date(value: str) -> str:
-    """JS Date string や各種形式を YYYY/MM/DD に変換"""
-    import re
-    v = value.strip()
-    if not v:
-        return ''
-    # 既に YYYY/MM/DD or YYYY-MM-DD
-    m = re.match(r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', v)
-    if m:
-        return f'{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}'
-    # JS Date string: "Tue Mar 31 2026 15:00:00 GMT+0800 ..."
-    months = {'Jan':'01','Feb':'02','Mar':'03','Apr':'04','May':'05','Jun':'06',
-              'Jul':'07','Aug':'08','Sep':'09','Oct':'10','Nov':'11','Dec':'12'}
-    m2 = re.match(r'\w+ (\w+) (\d+) (\d{4})', v)
-    if m2 and m2.group(1) in months:
-        return f'{m2.group(3)}/{months[m2.group(1)]}/{int(m2.group(2)):02d}'
-    # そのまま返す
-    return v
 
-class FillPayload(BaseModel):
-    payload: dict
-    flow_type: str = '発注稟議'
-    title: str = ''
-    row_num: int = 0
+# ── Login helper ────────────────────────────────────────
+async def login_jobcan(email: str, password: str) -> tuple[BrowserContext, dict]:
+    """Login, return (context, token_info)"""
+    browser = await get_browser()
+    context = await browser.new_context(
+        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    )
+    page = await context.new_page()
+    
+    # Stealth
+    await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    """)
+    
+    await page.goto(JOBCAN_LOGIN_URL)
+    await page.wait_for_load_state('networkidle')
+    await page.fill('#user_email', email)
+    await page.fill('#user_password', password)
+    await page.click('[name="commit"]')
+    
+    # Wait for login (poll for sign_in to disappear)
+    for _ in range(20):
+        await asyncio.sleep(1)
+        if 'sign_in' not in page.url:
+            break
+    
+    if 'sign_in' in page.url:
+        await context.close()
+        raise HTTPException(status_code=401, detail="Jobcan login failed")
+    
+    # Navigate to WF
+    await page.goto(JOBCAN_WF_BASE + '/', wait_until='domcontentloaded')
+    await asyncio.sleep(2)
+    
+    # Get tokens
+    cookies = await context.cookies()
+    csrf = next((c['value'] for c in cookies if c['name'] == 'csrftoken'), None)
+    sessionid = next((c['value'] for c in cookies if c['name'] == 'sessionid'), None)
+    
+    return context, {
+        "csrf": csrf,
+        "sessionid": sessionid,
+        "page": page,
+    }
 
+
+# ── Models ──────────────────────────────────────────────
 class FillRequest(BaseModel):
     email: str
     password: str
-    items: List[FillPayload]
-    action: str = 'draft'
+    items: list  # [{"payload": {...}, "flow_type": "発注稟議"}]
+    action: str = "draft"  # draft | submit
 
-class FillResult(BaseModel):
-    row_num: int
-    title: str
-    status: str
-    filled: int
-    errors: List[str]
-    message: str
-    debug: Optional[dict] = None
+class ReconJSRequest(BaseModel):
+    email: str
+    password: str
 
-# ══════════════════════════════════════════════════════════
-# App
-# ══════════════════════════════════════════════════════════
 
-app = FastAPI(title='mikai Jobcan Bridge', version='5.0.0')
-app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True,
-                   allow_methods=['*'], allow_headers=['*'])
+# ── App ─────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app):
+    print(f"[BOOT] mikai Jobcan Bridge v{VERSION} on port {PORT}")
+    yield
+    if _browser:
+        await _browser.close()
 
-def verify_key(x_api_key: Optional[str] = Header(None)):
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def check_api_key(x_api_key: str = Header(None)):
     if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail='Invalid API key')
+        raise HTTPException(status_code=403, detail="Invalid API key")
 
-@app.get('/api/health')
+
+@app.get("/health")
 async def health():
-    return {'status': 'ok', 'version': '5.1.0', 'strategy': 'direct_api_post'}
+    return {"status": "ok", "version": VERSION}
+
 
 # ══════════════════════════════════════════════════════════
-# /api/form-info — 取得 Jobcan form 定義（最重要的診斷）
+# /api/recon-js — 抓 AngularJS 源碼，找 submission body 格式
 # ══════════════════════════════════════════════════════════
 
-@app.post('/api/form-info')
-async def form_info(req: FillRequest, x_api_key: Optional[str] = Header(None)):
-    """登入 → /api/v1/forms/{id}/ を取得して返す"""
-    verify_key(x_api_key)
-    async with async_playwright() as p:
-        browser = await launch_browser(p)
-        page = await create_page(browser)
-        lr = await do_login(page, req.email, req.password)
-        if not lr['ok']:
-            await browser.close()
-            return {'error': lr['reason']}
-
-        # 両方のフォーム定義を取得
-        result = await page.evaluate('''async () => {
-            var out = {};
-            var ids = ["666628", "666591"];
-            for (var i = 0; i < ids.length; i++) {
-                try {
-                    var r = await fetch("/api/v1/forms/" + ids[i] + "/?request_user_id=1111126",
-                                        {credentials: "same-origin"});
-                    var text = await r.text();
-                    try { out[ids[i]] = {status: r.status, data: JSON.parse(text)}; }
-                    catch(e) { out[ids[i]] = {status: r.status, raw: text.substring(0, 5000)}; }
-                } catch(e) {
-                    out[ids[i]] = {error: e.message};
-                }
-            }
-            return out;
+@app.post("/api/recon-js")
+async def recon_js(req: ReconJSRequest, x_api_key: str = Header(None)):
+    check_api_key(x_api_key)
+    
+    context, tokens = await login_jobcan(req.email, req.password)
+    page = tokens["page"]
+    csrf = tokens["csrf"]
+    
+    results = {
+        "login": "ok",
+        "csrf": csrf,
+        "js_files": [],
+        "submission_snippets": [],
+        "form_json_snippets": [],
+        "angular_info": None,
+    }
+    
+    try:
+        # Collect all JS file URLs
+        js_urls = await page.evaluate('''() => {
+            return Array.from(document.querySelectorAll('script[src]')).map(s => s.src);
         }''')
-
-        await browser.close()
-        return result
-
-# ══════════════════════════════════════════════════════════
-# /api/recon — 偵察（token + API 路徑發現）
-# ══════════════════════════════════════════════════════════
-
-@app.post('/api/recon')
-async def recon(req: FillRequest, x_api_key: Optional[str] = Header(None)):
-    """登入 → cookie/token/API路徑/JS源碼を解析"""
-    verify_key(x_api_key)
-    async with async_playwright() as p:
-        browser = await launch_browser(p)
-        page = await create_page(browser)
-        lr = await do_login(page, req.email, req.password)
-        if not lr['ok']:
-            await browser.close()
-            return {'error': lr['reason']}
-
-        tokens = await extract_tokens(page)
-
-        # 全 XHR/fetch 攔截（パスフィルタなし — 全部記録）
-        all_requests = []
-        def on_request(req):
-            if req.resource_type in ('xhr', 'fetch', 'document'):
-                all_requests.append({
-                    'url': req.url[:200],
-                    'method': req.method,
-                    'type': req.resource_type,
-                })
-        page.on('request', on_request)
-
-        # WF ホームにいる状態で 5 秒間 XHR を観察
-        await page.wait_for_timeout(5000)
-
-        # フォームページに遷移して更に XHR を観察
-        try:
-            await page.goto(JOBCAN_WF_BASE + '/#/requests/new/666628',
-                            wait_until='domcontentloaded', timeout=15000)
-        except Exception:
-            pass
-        await page.wait_for_timeout(5000)
-
-        # JS 源碼から API パスを抽出（regex-free approach）
-        api_paths = await page.evaluate("""() => {
-            var paths = [];
-            var scripts = document.querySelectorAll("script");
-            for (var i = 0; i < scripts.length; i++) {
-                var text = scripts[i].textContent || "";
-                if (text.indexOf("api") === -1 && text.indexOf("requests") === -1) continue;
-                var words = text.split(/['"]/);
-                for (var j = 0; j < words.length; j++) {
-                    var w = words[j].trim();
-                    if (w.length > 3 && w.length < 100 && w.charAt(0) === "/") {
-                        if (w.indexOf("api") !== -1 || w.indexOf("requests") !== -1) {
-                            if (paths.indexOf(w) === -1) paths.push(w);
-                        }
+        results["js_files"] = js_urls
+        
+        # Search patterns for submission logic
+        search_terms = [
+            'requests/new', 'requests/create', 'request/new',
+            'form_json', 'formJson', 'form_id', 'formId',
+            'is_draft', 'isDraft', 'is_save',
+            'flow_id', 'flowId',
+            'group_id', 'groupId', 
+            'submitRequest', 'createRequest', 'saveRequest', 'saveDraft',
+            'newRequest', 'postRequest',
+            '$http.post',
+        ]
+        
+        # Download and search each non-library JS file
+        for js_url in js_urls:
+            fname = js_url.split('/')[-1].split('?')[0]
+            # Skip known libraries
+            if any(lib in fname.lower() for lib in ['angular.min', 'angular-', 'jquery', 'bootstrap', 'moment', 'lodash', 'underscore', 'ui-']):
+                continue
+            
+            try:
+                js_content = await page.evaluate('''async (url) => {
+                    try {
+                        const r = await fetch(url);
+                        return await r.text();
+                    } catch(e) { return "ERR:" + e.message; }
+                }''', js_url)
+                
+                if js_content.startswith("ERR:") or len(js_content) < 100:
+                    continue
+                
+                file_size = len(js_content)
+                
+                for term in search_terms:
+                    # Case-insensitive search
+                    for m in re.finditer(re.escape(term), js_content, re.IGNORECASE):
+                        start = max(0, m.start() - 300)
+                        end = min(len(js_content), m.end() + 300)
+                        snippet = js_content[start:end]
+                        
+                        cat = "submission" if any(t in term.lower() for t in ['request', 'submit', 'save', 'draft', 'post', 'create']) else "form_json"
+                        
+                        results[f"{cat}_snippets"].append({
+                            "file": fname[:60],
+                            "size": file_size,
+                            "term": term,
+                            "snippet": snippet,
+                        })
+            except Exception as e:
+                pass
+        
+        # Try to get AngularJS route info
+        angular_info = await page.evaluate('''() => {
+            try {
+                if (!window.angular) return {error: "no angular"};
+                const inj = angular.element(document.body).injector();
+                if (!inj) return {error: "no injector"};
+                const $route = inj.get("$route");
+                const routes = {};
+                if ($route && $route.routes) {
+                    for (const [p, c] of Object.entries($route.routes)) {
+                        routes[p] = {controller: c.controller, template: c.templateUrl};
                     }
                 }
-            }
-            return paths.slice(0, 30);
-        }""")
-
-        # 外部 JS ファイルの URL も取得
-        script_srcs = await page.evaluate('''() => {
-            var srcs = [];
-            var scripts = document.querySelectorAll("script[src]");
-            for (var i = 0; i < scripts.length; i++) {
-                srcs.push(scripts[i].src);
-            }
-            return srcs;
+                return {version: angular.version?.full, routes};
+            } catch(e) { return {error: e.message}; }
         }''')
+        results["angular_info"] = angular_info
+        
+        # Deduplicate
+        seen = set()
+        for key in ["submission_snippets", "form_json_snippets"]:
+            unique = []
+            for item in results[key]:
+                sig = item.get("snippet", "")[:100]
+                if sig not in seen:
+                    seen.add(sig)
+                    unique.append(item)
+            results[key] = unique[:30]
+        
+    finally:
+        await context.close()
+    
+    return results
 
-        # API パス探索: 複数の候補パスに GET を投げて存在確認
-        probe_paths = [
-            '/api/', '/wf/api/', '/api/v1/', '/wf/api/v1/',
-            '/api/requests/', '/wf/api/requests/',
-            '/api/v1/requests/', '/wf/api/v1/requests/',
-            '/expense/api/', '/workflow/api/',
-        ]
-        probe_results = await page.evaluate('''async (paths) => {
-            var results = [];
-            for (var i = 0; i < paths.length; i++) {
-                try {
-                    var r = await fetch(paths[i], {credentials: "same-origin"});
-                    results.push({path: paths[i], status: r.status});
-                } catch(e) {
-                    results.push({path: paths[i], error: e.message});
-                }
-            }
-            return results;
-        }''', probe_paths)
-
-        # フォーム定義を取得（flow_id, group_id, 必須フィールドの確認）
-        form_defs = await page.evaluate('''async () => {
-            var forms = {};
-            var ids = ["666628", "666591"];
-            for (var i = 0; i < ids.length; i++) {
-                try {
-                    var r = await fetch("/api/v1/forms/" + ids[i] + "/?request_user_id=1111126",
-                                        {credentials: "same-origin"});
-                    var text = await r.text();
-                    var json = null;
-                    try { json = JSON.parse(text); } catch(e) {}
-                    forms[ids[i]] = {status: r.status, body: json || text.substring(0, 3000)};
-                } catch(e) {
-                    forms[ids[i]] = {error: e.message};
-                }
-            }
-            return forms;
-        }''')
-
-        await browser.close()
-        return {
-            'login': 'ok',
-            'tokens': {
-                'xsrf': tokens['xsrf'][:50] if tokens['xsrf'] else None,
-                'csrf': tokens['csrf'][:50] if tokens['csrf'] else None,
-            },
-            'all_cookies': tokens['all_cookies'],
-            'xhr_requests': all_requests[:30],
-            'js_api_paths': api_paths[:30],
-            'script_srcs': script_srcs[:10],
-            'path_probes': probe_results,
-            'form_defs': form_defs,
-        }
 
 # ══════════════════════════════════════════════════════════
-# /api/fill — メイン
+# /api/fill — 系統性嘗試多種 body 格式
 # ══════════════════════════════════════════════════════════
 
-@app.post('/api/fill')
-async def fill_jobcan(req: FillRequest, x_api_key: Optional[str] = Header(None)):
-    verify_key(x_api_key)
-    if not req.items:
-        raise HTTPException(status_code=400, detail='items が空です')
-
-    results = []
-    try:
-        async with async_playwright() as p:
-            browser = await launch_browser(p)
-            page = await create_page(browser)
-
-            lr = await do_login(page, req.email, req.password)
-            if not lr['ok']:
-                await browser.close()
-                return JSONResponse(status_code=401, content={'error': lr['reason']})
-            print('[MAIN] Login OK')
-
-            tokens = await extract_tokens(page)
-            if not tokens['xsrf'] and not tokens['csrf']:
-                # Token なしでも試す（Jobcan が cookie だけで認証する可能性）
-                print('[MAIN] WARNING: No CSRF tokens found, trying anyway')
-
-            for i, item in enumerate(req.items):
-                print(f'[MAIN] Item {i+1}/{len(req.items)}: {item.title}')
-                r = await submit_item(page, item, tokens, req.action)
-                results.append(r)
-                print(f'[MAIN] -> {r.status}: {r.message[:80]}')
-
-            await browser.close()
-    except Exception as e:
-        print(f'[MAIN] Fatal: {traceback.format_exc()}')
-        return JSONResponse(status_code=500, content={'error': str(e)[:200]})
-
-    return {'results': [r.model_dump() for r in results]}
-
-# ══════════════════════════════════════════════════════════
-# ブラウザ
-# ══════════════════════════════════════════════════════════
-
-async def launch_browser(p):
-    return await p.chromium.launch(headless=True, args=[
-        '--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage',
-        '--disable-gpu','--disable-blink-features=AutomationControlled'])
-
-async def create_page(browser):
-    ctx = await browser.new_context(
-        viewport={'width':1280,'height':900}, locale='ja-JP',
-        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
-    await ctx.add_init_script('Object.defineProperty(navigator,"webdriver",{get:()=>undefined})')
-    return await ctx.new_page()
-
-# ══════════════════════════════════════════════════════════
-# Login（検証済み）
-# ══════════════════════════════════════════════════════════
-
-async def do_login(page, email: str, password: str) -> dict:
-    try:
-        await page.goto(JOBCAN_LOGIN_URL, wait_until='networkidle', timeout=30000)
-        await page.wait_for_timeout(2000)
-    except Exception as e:
-        return {'ok': False, 'reason': f'ログインページ接続失敗: {str(e)[:100]}'}
-
-    url = page.url
-    if 'wf.jobcan.jp' in url:
-        return {'ok': True}
-    if 'id.jobcan.jp' in url and 'sign_in' not in url:
-        return await _goto_wf(page)
-    if not await page.query_selector('#user_email'):
-        return {'ok': False, 'reason': f'ログインフォーム不明: {url}'}
-
-    try:
-        await page.fill('#user_email', email)
-        await page.fill('#user_password', password)
-        await page.wait_for_timeout(500)
-        await page.click('[name="commit"]')
-    except Exception as e:
-        return {'ok': False, 'reason': f'入力エラー: {str(e)[:80]}'}
-
-    # sign_in から離れるのを待つ
-    for _ in range(20):
-        await page.wait_for_timeout(1000)
-        if 'sign_in' not in page.url:
-            break
-    else:
-        return {'ok': False, 'reason': 'ログイン失敗（タイムアウト）'}
-
-    return await _goto_wf(page)
-
-async def _goto_wf(page) -> dict:
-    try:
-        await page.goto(JOBCAN_WF_BASE + '/', wait_until='domcontentloaded', timeout=30000)
-        await page.wait_for_timeout(5000)
-    except Exception as e:
-        return {'ok': False, 'reason': f'WF接続失敗: {str(e)[:100]}'}
-    if 'sign_in' in page.url:
-        return {'ok': False, 'reason': 'セッション無効'}
-    print(f'[LOGIN] OK at {page.url}')
-    return {'ok': True}
-
-# ══════════════════════════════════════════════════════════
-# CSRF Token（QA修正: URL decode 追加）
-# ══════════════════════════════════════════════════════════
-
-async def extract_tokens(page) -> dict:
-    xsrf = ''
-    csrf = ''
-    all_cookies = []
-
-    # Method 1: Playwright cookies
-    cookies = await page.context.cookies()
-    for c in cookies:
-        all_cookies.append(f'{c["name"]}={c["value"][:40]}')
-        if c['name'] == 'XSRF-TOKEN':
-            xsrf = unquote(c['value'])  # URL decode
-        elif c['name'] in ('csrftoken', 'csrf_token', '_csrf'):
-            csrf = unquote(c['value'])
-
-    # Method 2: document.cookie
-    if not xsrf:
-        doc_cookie = await page.evaluate('document.cookie')
-        for part in doc_cookie.split(';'):
-            part = part.strip()
-            if part.startswith('XSRF-TOKEN='):
-                xsrf = unquote(part.split('=', 1)[1])
-
-    # Fallback: CSRF = XSRF
-    if not csrf:
-        csrf = xsrf
-
-    print(f'[TOKEN] XSRF={xsrf[:30] if xsrf else "NONE"} | CSRF={csrf[:30] if csrf else "NONE"}')
-    print(f'[TOKEN] Cookies: {", ".join(all_cookies[:15])}')
-    return {'xsrf': xsrf, 'csrf': csrf, 'all_cookies': all_cookies}
-
-# ══════════════════════════════════════════════════════════
-# form_json 構築（QA修正: type 13 早期 skip）
-# ══════════════════════════════════════════════════════════
-
-def build_form_json(payload: dict) -> list:
-    """
-    AD 欄 payload → Jobcan form_json。
-    支援兩種 key 格式:
-      1. form_itemXXXXXXX（直接對應）
-      2. 語意化 alias（vendor_name 等，透過 ALIAS_MAP 轉換）
-    """
+def build_form_json_666628(payload: dict) -> list:
+    """Build complete form_json for 発注稟議 with ALL required fields."""
+    
+    # Alias key → form field mapping (from JOBCAN_API_REFERENCE.md recon)
+    ALIAS_MAP = {
+        "ringi_type":       (3831493, "稟議の種類", 7),
+        "contract_date":    (3831494, "契約締結日", 4),
+        "content_type":     (3818321, "内容", 7),
+        "application_type": (3818329, "申請内容", 7),
+        "vendor_type":      (3818323, "取引先種別", 6),
+        "vendor_name":      (3822625, "取引先名", 1),
+        "vendor_website":   (3818337, "取引先ウェブサイト", 1),
+        "bank_info":        (3841064, "銀行情報", 2),
+        "tax_status":       (3841065, "課税事業者情報", 6),
+        "tax_number":       (3841066, "課税事業者番号", 1),
+        "project_name":     (3831525, "プロジェクトまたは予算項目名", 1),
+        "contract_purpose": (3831524, "契約書名・目的", 2),
+        "budget_method":    (4143713, "予算稟議の方法", 6),
+        "budget_request":   (3818322, "予算申請", 13),
+        "multi_budget":     (4143714, "複数予算申請記載欄", 2),
+        "budget_note":      (3818328, "予算関連備考", 2),
+        "amount_range":     (3869371, "金額の範囲", 6),
+        "amount":           (3818325, "発注額", 3),
+        "payment_cycle":    (3818340, "支払サイクル", 6),
+        "antisocial":       (3818330, "反社チェック", 5),
+        "stock_number":     (3818331, "証券番号", 1),
+        "antisocial_num":   (3818332, "反社チェック完了番号", 1),
+        "nda":              (3831551, "秘密保持契約書の締結", 6),
+        "basic_contract":   (3831552, "取引基本契約書", 6),
+        "competitor_quote": (3822626, "相見積もり", 5),
+        "signing_method":   (3818338, "締結方法", 5),
+        "legal_check":      (3831553, "リーガルチェック", 5),
+        "legal_url":        (3818339, "リーガルチェックURL", 1),
+        "payment_method":   (3818341, "支払手段", 6),
+    }
+    
+    # Also support direct form_item keys
+    DIRECT_MAP = {}
+    for alias, (fid, name, itype) in ALIAS_MAP.items():
+        DIRECT_MAP[f"form_item{fid}"] = (fid, name, itype)
+    
     items = []
-    seen_ids = set()  # 重複防止
-
-    for raw_key, value in payload.items():
-        if raw_key.startswith('_'):
+    for key, value in payload.items():
+        if key.startswith('_'):
             continue
         value = str(value).strip()
         if not value:
             continue
-
-        # key 解決: alias → form_item ID
-        if raw_key.startswith('form_item'):
-            input_name = raw_key
-        elif raw_key in ALIAS_MAP:
-            input_name = ALIAS_MAP[raw_key]
+        
+        if key in ALIAS_MAP:
+            fid, name, itype = ALIAS_MAP[key]
+        elif key in DIRECT_MAP:
+            fid, name, itype = DIRECT_MAP[key]
         else:
-            # 未知の key → スキップ（title, currency 等のメタ情報）
             continue
-
-        fdef = FIELD_DEFS.get(input_name)
-        if not fdef:
-            continue
-        if fdef['type'] == 13:
-            continue
-        if fdef['id'] in seen_ids:
-            continue  # 同じフィールドの重複を防止
-        seen_ids.add(fdef['id'])
-
-        # 日付フォーマット変換
-        if fdef['type'] == 4:
-            value = normalize_date(value)
-
+        
         item = {
-            'id': int(fdef['id']),
-            'input_name': input_name,
-            'item_name': fdef['name'],
-            'item_type': fdef['type'],
-            'request_content': value,
+            "id": fid,
+            "input_name": f"form_item{fid}",
+            "item_name": name,
+            "item_type": itype,
+            "request_content": value,
         }
-
-        if fdef['type'] == 7 and 'options' in fdef:
-            checked = [v.strip() for v in value.split(',')]
-            item['select_item_labels'] = fdef['options']
-            item['select_item_labels_obj'] = [
-                {'label': opt, 'checked': opt in checked}
-                for opt in fdef['options']
-            ]
-
+        
+        # For checkbox (type 7), add select_item_labels
+        if itype == 7:
+            labels_map = {
+                3831493: ["稟議", "事後稟議", "再稟議"],
+                3818321: ["当社からの支払い（費用）", "取引先からの受取（売上）"],
+                3818329: ["契約書", "発注書", "申込書", "利用規約合意"],
+            }
+            if fid in labels_map:
+                all_labels = labels_map[fid]
+                item["select_item_labels"] = all_labels
+                item["select_item_labels_obj"] = [
+                    {"label": l, "checked": l == value or value in l} 
+                    for l in all_labels
+                ]
+        
+        # For radio (type 5), add select_item_labels
+        if itype == 5:
+            labels_map = {
+                3818330: ["上場企業(不要)", "非上場企業（反社チェック実施）"],
+                3822626: ["未", "済"],
+                3818338: ["電子契約", "書面契約（捺印）", "利用規約合意", "その他"],
+                3831553: ["YES", "NO"],
+            }
+            if fid in labels_map:
+                item["select_item_labels"] = labels_map[fid]
+        
+        # For dropdown (type 6), add select_item_labels
+        if itype == 6:
+            labels_map = {
+                3818323: ["新規", "既存"],
+                3841065: ["課税事業者", "免税事業者"],
+                4143713: ["単独", "複数"],
+                3869371: ["予算内", "500万円以上", "期間総予算の5%を超えるもの"],
+                3818340: ["単発", "30日", "60日", "75日", "その他"],
+                3831551: ["YES", "NO"],
+                3831552: ["YES", "NO"],
+                3818341: ["銀行振込", "クレジットカード", "Paypal", "紙付書", "その他"],
+            }
+            if fid in labels_map:
+                item["select_item_labels"] = labels_map[fid]
+        
         items.append(item)
-
+    
     return items
 
-# ══════════════════════════════════════════════════════════
-# API 送信（QA修正: 2 種格式で試行）
-# ══════════════════════════════════════════════════════════
 
-async def submit_item(page, item: FillPayload, tokens: dict, action: str) -> FillResult:
+@app.post("/api/fill")
+async def fill(req: FillRequest, x_api_key: str = Header(None)):
+    check_api_key(x_api_key)
+    
+    context, tokens = await login_jobcan(req.email, req.password)
+    page = tokens["page"]
+    csrf = tokens["csrf"]
+    
+    print(f"[LOGIN] OK")
+    print(f"[TOKEN] CSRF={csrf}")
+    
+    results = []
+    
     try:
-        form_id = FLOW_TO_FORM.get(item.flow_type, '666628')
-        meta = FORM_META.get(form_id, {})
-        form_json = build_form_json(item.payload)
-        filled_count = len(form_json)
+        for idx, item in enumerate(req.items):
+            payload = item.get("payload", {})
+            flow_type = item.get("flow_type", "発注稟議")
+            title = payload.get("_title", payload.get("title", "mikai自動申請"))
+            
+            print(f"\n[MAIN] Item {idx+1}/{len(req.items)}: {title}")
+            
+            if flow_type == "発注稟議":
+                form_id = 666628
+                flow_id = FORM_666628["flow_id"]
+                group_id = FORM_666628["group_id"]
+                form_json_items = build_form_json_666628(payload)
+            else:
+                results.append({
+                    "row": idx, "status": "skip",
+                    "message": f"未対応の flow_type: {flow_type}"
+                })
+                continue
+            
+            is_draft = req.action == "draft"
+            
+            print(f"[API] form_json has {len(form_json_items)} items")
+            
+            # ── Try multiple body format patterns ──
+            patterns = []
+            
+            # Pattern 1: form_json as list, with flow_id/group_id at top level
+            patterns.append(("P1: list + flow+group", {
+                "form_id": form_id,
+                "flow_id": flow_id,
+                "group_id": group_id,
+                "title": title,
+                "is_draft": is_draft,
+                "form_json": form_json_items,
+            }))
+            
+            # Pattern 2: form_json as stringified JSON
+            patterns.append(("P2: stringified form_json", {
+                "form_id": form_id,
+                "flow_id": flow_id,
+                "group_id": group_id,
+                "title": title,
+                "is_draft": is_draft,
+                "form_json": json.dumps(form_json_items, ensure_ascii=False),
+            }))
+            
+            # Pattern 3: with "group" instead of "group_id"
+            patterns.append(("P3: group instead of group_id", {
+                "form_id": form_id,
+                "flow_id": flow_id,
+                "group": group_id,
+                "title": title,
+                "is_draft": is_draft,
+                "form_json": form_json_items,
+            }))
+            
+            # Pattern 4: with client field
+            patterns.append(("P4: with client", {
+                "form_id": form_id,
+                "flow_id": flow_id,
+                "group_id": group_id,
+                "client": FORM_666628["client"],
+                "title": title,
+                "is_draft": is_draft,
+                "form_json": form_json_items,
+            }))
+            
+            # Pattern 5: form as multipart-like structure
+            patterns.append(("P5: form + request_json", {
+                "form": form_id,
+                "flow": flow_id,
+                "group": group_id,
+                "title": title,
+                "is_draft": is_draft,
+                "request_json": form_json_items,
+            }))
+            
+            # Pattern 6: No is_draft, add status field
+            patterns.append(("P6: status=draft", {
+                "form_id": form_id,
+                "flow_id": flow_id,
+                "group_id": group_id,
+                "title": title,
+                "status": "draft",
+                "form_json": form_json_items,
+            }))
+            
+            # Pattern 7: Minimal — just form_id and form_json
+            patterns.append(("P7: minimal", {
+                "form_id": form_id,
+                "form_json": form_json_items,
+            }))
+            
+            # Pattern 8: form_json stringified + all metadata
+            patterns.append(("P8: stringified + all meta", {
+                "form_id": form_id,
+                "flow_id": flow_id,
+                "group_id": group_id,
+                "group_name": FORM_666628["group_name"],
+                "client": FORM_666628["client"],
+                "form_type": FORM_666628["form_type"],
+                "title": title,
+                "is_draft": is_draft,
+                "form_json": json.dumps(form_json_items, ensure_ascii=False),
+            }))
+            
+            # Pattern 9: with request_user_id
+            patterns.append(("P9: with user_id", {
+                "form_id": form_id,
+                "flow_id": flow_id,
+                "group_id": group_id,
+                "request_user_id": 1111126,
+                "title": title,
+                "is_draft": is_draft,
+                "form_json": form_json_items,
+            }))
+            
+            # Pattern 10: snake_case form_items (not form_json)
+            patterns.append(("P10: form_items key", {
+                "form_id": form_id,
+                "flow_id": flow_id,
+                "group_id": group_id,
+                "title": title,
+                "is_draft": is_draft,
+                "form_items": form_json_items,
+            }))
+            
+            # Try each pattern
+            attempt_results = []
+            for pname, body in patterns:
+                try:
+                    body_str = json.dumps(body, ensure_ascii=False)
+                    print(f"[API] {pname}: {body_str[:200]}...")
+                    
+                    resp = await page.evaluate('''async (args) => {
+                        const [url, body, csrf] = args;
+                        try {
+                            const r = await fetch(url, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-CSRFToken': csrf,
+                                    'X-Requested-With': 'XMLHttpRequest',
+                                    'Referer': 'https://ssl.wf.jobcan.jp/',
+                                },
+                                body: body,
+                                credentials: 'include',
+                            });
+                            const status = r.status;
+                            let text = '';
+                            try { text = await r.text(); } catch(e) {}
+                            // Try to parse as JSON
+                            let json_data = null;
+                            try { json_data = JSON.parse(text); } catch(e) {}
+                            return {status, text: text.substring(0, 500), json: json_data};
+                        } catch(e) {
+                            return {error: e.message};
+                        }
+                    }''', [
+                        f"{JOBCAN_WF_BASE}/api/v1/requests/new/",
+                        body_str,
+                        csrf,
+                    ])
+                    
+                    status = resp.get('status', 0)
+                    print(f"[API] {pname} → HTTP {status}")
+                    
+                    attempt_results.append({
+                        "pattern": pname,
+                        "http_status": status,
+                        "response_preview": resp.get('text', '')[:300],
+                        "json_response": resp.get('json'),
+                    })
+                    
+                    # If we got anything other than 500, that's progress!
+                    if status not in (500,):
+                        print(f"[API] ★★★ {pname} got HTTP {status}! Breaking. ★★★")
+                        if status in (200, 201):
+                            results.append({
+                                "row": idx, "status": "success",
+                                "pattern": pname,
+                                "response": resp.get('json') or resp.get('text', ''),
+                            })
+                        else:
+                            # 400, 403, 422 etc = body format closer, but validation error
+                            results.append({
+                                "row": idx, "status": "validation_error",
+                                "pattern": pname, "http_status": status,
+                                "response": resp.get('json') or resp.get('text', '')[:500],
+                            })
+                        break
+                    
+                except Exception as e:
+                    attempt_results.append({
+                        "pattern": pname,
+                        "error": str(e)[:200],
+                    })
+            else:
+                # All patterns returned 500
+                results.append({
+                    "row": idx, "status": "all_500",
+                    "message": "全 pattern 都回 500",
+                    "attempts": attempt_results,
+                })
+    
+    finally:
+        await context.close()
+    
+    return {"results": results}
 
-        # 診断ログ: 受信した key と変換結果
-        payload_keys = [k for k in item.payload.keys() if not k.startswith('_')]
-        mapped_keys = [it['input_name'] for it in form_json]
-        skipped_keys = [k for k in payload_keys if k not in ALIAS_MAP and not k.startswith('form_item')]
-        print(f'[API] Payload keys: {payload_keys}')
-        print(f'[API] Mapped to: {mapped_keys}')
-        if skipped_keys:
-            print(f'[API] Skipped (no mapping): {skipped_keys}')
 
-        if filled_count == 0:
-            return FillResult(row_num=item.row_num, title=item.title, status='error',
-                filled=0, errors=['入力データなし'], message='payload にフィールドがありません。')
+# ══════════════════════════════════════════════════════════
+# /api/probe — 輕量測試：只測 API 路徑 + 基本 body
+# ══════════════════════════════════════════════════════════
 
-        # Body 構築（QA修正: 空の flow_id/group_id は送らない）
-        body = {'form_id': int(form_id), 'form_json': form_json}
-        if meta.get('flow_id'):
-            body['flow_id'] = meta['flow_id']
-        if meta.get('group_id'):
-            body['group_id'] = meta['group_id']
-            body['group_name'] = meta.get('group_name', '')
-        # title があれば追加（申請タイトル）
-        title = item.payload.get('title', '') or item.title
-        if title:
-            body['title'] = title
-        if action == 'draft':
-            body['is_draft'] = True
-
-        xsrf = tokens.get('xsrf', '')
-        csrf = tokens.get('csrf', '')
-
-        # === 試行 1: form_json を list として送信 ===
-        body_json = json.dumps(body, ensure_ascii=False)
-        print(f'[API] Attempt 1 (list): {body_json[:300]}...')
-
-        result = await _do_fetch(page, body_json, xsrf, csrf)
-        used_path = result.get('path', '?')
-        print(f'[API] Attempt 1 result: HTTP {result.get("status")} via {used_path}')
-
-        # 成功
-        if result.get('ok'):
-            return _build_success(item, filled_count, result, action)
-
-        # === 試行 2: form_json を JSON string として送信 ===
-        if result.get('status') in (400, 422, 500):
-            print('[API] Attempt 1 failed with 400/422, trying form_json as string...')
-            body2 = dict(body)
-            body2['form_json'] = json.dumps(form_json, ensure_ascii=False)
-            body_json2 = json.dumps(body2, ensure_ascii=False)
-            result2 = await _do_fetch(page, body_json2, xsrf, csrf)
-            print(f'[API] Attempt 2 result: HTTP {result2.get("status")}')
-            if result2.get('ok'):
-                return _build_success(item, filled_count, result2, action)
-            # 両方失敗 → 詳細な方を返す
-            result = result2 if len(str(result2.get('body',''))) > len(str(result.get('body',''))) else result
-
-        # === 試行 3: is_draft を外して再試行（draft パラメータが不正の場合）===
-        if result.get('status') in (400, 422, 500) and action == 'draft':
-            print('[API] Attempt 3: removing is_draft...')
-            body3 = dict(body)
-            body3.pop('is_draft', None)
-            body_json3 = json.dumps(body3, ensure_ascii=False)
-            result3 = await _do_fetch(page, body_json3, xsrf, csrf)
-            print(f'[API] Attempt 3 result: HTTP {result3.get("status")}')
-            if result3.get('ok'):
-                return _build_success(item, filled_count, result3, '通常申請（下書きパラメータ不明）')
-            result = result3
-
-        # 全失敗
-        status = result.get('status', 0)
-        err_body = result.get('body', result.get('error', 'unknown'))
-        return FillResult(
-            row_num=item.row_num, title=item.title, status='error',
-            filled=filled_count,
-            errors=[f'API HTTP {status}'],
-            message=f'Jobcan API エラー (HTTP {status}): {str(err_body)[:300]}',
-            debug={'response': result, 'sent_body_preview': body_json[:500]})
-
-    except Exception as e:
-        print(f'[API] Exception: {traceback.format_exc()}')
-        return FillResult(row_num=item.row_num, title=item.title, status='error',
-            filled=0, errors=[str(e)[:100]], message=f'エラー: {str(e)[:100]}')
-
-
-async def _do_fetch(page, body_json: str, xsrf: str, csrf: str) -> dict:
-    """ブラウザ内 fetch() で Jobcan API に POST — 複数パスを試行"""
-    # recon 結果: 真實 API は /api/v1/ 配下
-    # XHR: /api/v1/forms/, /api/v1/users/, /api/v1/cloudsign/
-    paths = [
-        '/api/v1/requests/',         # 最有力（recon で /api/v1/ が確認済み）
-        '/api/v1/requests/new/',     # new 付き
-        '/api/v1/request/create/',   # create パターン
-        '/wf/api/requests/new/',     # 旧パス（念のため）
-    ]
-
-    return await page.evaluate('''async (args) => {
-        var body = args[0], xsrf = args[1], csrf = args[2], paths = args[3];
-        var headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Referer": location.href,
-            "X-Requested-With": "XMLHttpRequest"
-        };
-        if (xsrf) headers["X-XSRF-TOKEN"] = xsrf;
-        if (csrf) headers["X-CSRFToken"] = csrf;
-
-        // 各パスを順番に試す
-        for (var i = 0; i < paths.length; i++) {
-            try {
-                var resp = await fetch(paths[i], {
-                    method: "POST",
-                    headers: headers,
-                    credentials: "same-origin",
-                    body: body
-                });
-                var text = await resp.text();
-                var json = null;
-                try { json = JSON.parse(text); } catch(e) {}
-
-                // 404 以外 → この path が正しい（成功でもエラーでも）
-                if (resp.status !== 404) {
-                    return {ok: resp.ok, status: resp.status, statusText: resp.statusText,
-                            body: text.substring(0, 2000), json: json, path: paths[i]};
-                }
-            } catch(e) {
-                // fetch 自体が失敗 → 次のパスへ
-            }
+@app.post("/api/probe")
+async def probe(req: FillRequest, x_api_key: str = Header(None)):
+    """快速測試多個 API 路徑和 body 組合"""
+    check_api_key(x_api_key)
+    
+    context, tokens = await login_jobcan(req.email, req.password)
+    page = tokens["page"]
+    csrf = tokens["csrf"]
+    
+    try:
+        # Minimal test body
+        test_body = {
+            "form_id": 666628,
+            "flow_id": 401080,
+            "group_id": 560177,
+            "title": "テスト",
+            "is_draft": True,
+            "form_json": build_form_json_666628({
+                "ringi_type": "稟議",
+                "contract_date": "2026/04/04",
+                "content_type": "当社からの支払い（費用）",
+                "application_type": "発注書",
+                "vendor_type": "新規",
+                "vendor_name": "テスト株式会社",
+                "project_name": "テストプロジェクト",
+                "contract_purpose": "テスト発注",
+                "budget_method": "単独",
+                "amount_range": "予算内",
+                "amount": "100000",
+                "payment_cycle": "単発",
+                "nda": "NO",
+                "basic_contract": "NO",
+                "payment_method": "銀行振込",
+                "tax_status": "課税事業者",
+            }),
         }
+        
+        # Test paths
+        paths = [
+            "/api/v1/requests/new/",
+            "/api/v1/requests/",
+            "/api/v1/request/new/",
+            "/api/v1/request/create/",
+        ]
+        
+        # Test content types
+        content_types = [
+            "application/json",
+            "application/x-www-form-urlencoded",
+        ]
+        
+        probe_results = []
+        
+        for path in paths:
+            for ct in content_types:
+                body_str = json.dumps(test_body, ensure_ascii=False)
+                
+                resp = await page.evaluate('''async (args) => {
+                    const [url, body, csrf, contentType] = args;
+                    try {
+                        const headers = {
+                            'Content-Type': contentType,
+                            'X-CSRFToken': csrf,
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'Referer': 'https://ssl.wf.jobcan.jp/',
+                        };
+                        
+                        let finalBody = body;
+                        if (contentType === 'application/x-www-form-urlencoded') {
+                            const obj = JSON.parse(body);
+                            const params = new URLSearchParams();
+                            for (const [k, v] of Object.entries(obj)) {
+                                params.append(k, typeof v === 'object' ? JSON.stringify(v) : String(v));
+                            }
+                            finalBody = params.toString();
+                        }
+                        
+                        const r = await fetch(url, {
+                            method: 'POST',
+                            headers,
+                            body: finalBody,
+                            credentials: 'include',
+                        });
+                        const status = r.status;
+                        let text = '';
+                        try { text = await r.text(); } catch(e) {}
+                        let json_data = null;
+                        try { json_data = JSON.parse(text); } catch(e) {}
+                        return {status, text: text.substring(0, 300), json: json_data};
+                    } catch(e) {
+                        return {error: e.message};
+                    }
+                }''', [
+                    f"{JOBCAN_WF_BASE}{path}",
+                    body_str,
+                    csrf,
+                    ct,
+                ])
+                
+                probe_results.append({
+                    "path": path,
+                    "content_type": ct,
+                    "status": resp.get("status"),
+                    "response": resp.get("json") or resp.get("text", "")[:300],
+                })
+                
+                print(f"[PROBE] {path} ({ct}) → {resp.get('status')}")
+        
+        return {"csrf": csrf, "results": probe_results}
+    
+    finally:
+        await context.close()
 
-        // 全パス 404
-        return {ok: false, status: 404, error: "All API paths returned 404: " + paths.join(", "),
-                tried_paths: paths};
-    }''', [body_json, xsrf, csrf, paths])
-
-
-def _build_success(item: FillPayload, filled: int, result: dict, action: str) -> FillResult:
-    resp_json = result.get('json') or {}
-    request_id = str(resp_json.get('id', resp_json.get('request_id', '')))
-    label = '下書き保存' if action == 'draft' else '申請'
-    msg = f'{label}しました。'
-    if request_id:
-        msg += f' 申請番号: {request_id}'
-    return FillResult(row_num=item.row_num, title=item.title, status='success',
-        filled=filled, errors=[], message=msg)
 
 # ══════════════════════════════════════════════════════════
-# Entry
+# Main
 # ══════════════════════════════════════════════════════════
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get('PORT', 8080))
-    print(f'[BOOT] mikai Jobcan Bridge v5.0.0 on port {port}')
-    uvicorn.run(app, host='0.0.0.0', port=port)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
