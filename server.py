@@ -252,6 +252,25 @@ async def recon(req: FillRequest, x_api_key: Optional[str] = Header(None)):
             return results;
         }''', probe_paths)
 
+        # フォーム定義を取得（flow_id, group_id, 必須フィールドの確認）
+        form_defs = await page.evaluate('''async () => {
+            var forms = {};
+            var ids = ["666628", "666591"];
+            for (var i = 0; i < ids.length; i++) {
+                try {
+                    var r = await fetch("/api/v1/forms/" + ids[i] + "/?request_user_id=1111126",
+                                        {credentials: "same-origin"});
+                    var text = await r.text();
+                    var json = null;
+                    try { json = JSON.parse(text); } catch(e) {}
+                    forms[ids[i]] = {status: r.status, body: json || text.substring(0, 3000)};
+                } catch(e) {
+                    forms[ids[i]] = {error: e.message};
+                }
+            }
+            return forms;
+        }''')
+
         await browser.close()
         return {
             'login': 'ok',
@@ -264,6 +283,7 @@ async def recon(req: FillRequest, x_api_key: Optional[str] = Header(None)):
             'js_api_paths': api_paths[:30],
             'script_srcs': script_srcs[:10],
             'path_probes': probe_results,
+            'form_defs': form_defs,
         }
 
 # ══════════════════════════════════════════════════════════
@@ -521,7 +541,7 @@ async def submit_item(page, item: FillPayload, tokens: dict, action: str) -> Fil
             return _build_success(item, filled_count, result, action)
 
         # === 試行 2: form_json を JSON string として送信 ===
-        if result.get('status') in (400, 422):
+        if result.get('status') in (400, 422, 500):
             print('[API] Attempt 1 failed with 400/422, trying form_json as string...')
             body2 = dict(body)
             body2['form_json'] = json.dumps(form_json, ensure_ascii=False)
@@ -534,7 +554,7 @@ async def submit_item(page, item: FillPayload, tokens: dict, action: str) -> Fil
             result = result2 if len(str(result2.get('body',''))) > len(str(result.get('body',''))) else result
 
         # === 試行 3: is_draft を外して再試行（draft パラメータが不正の場合）===
-        if result.get('status') in (400, 422) and action == 'draft':
+        if result.get('status') in (400, 422, 500) and action == 'draft':
             print('[API] Attempt 3: removing is_draft...')
             body3 = dict(body)
             body3.pop('is_draft', None)
