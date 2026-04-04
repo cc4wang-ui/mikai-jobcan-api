@@ -163,12 +163,12 @@ async def health():
     return {'status': 'ok', 'version': '5.0.0', 'strategy': 'direct_api_post'}
 
 # ══════════════════════════════════════════════════════════
-# /api/recon — 偵察（token + API 形式の確認）
+# /api/recon — 偵察（token + API 路徑發現）
 # ══════════════════════════════════════════════════════════
 
 @app.post('/api/recon')
 async def recon(req: FillRequest, x_api_key: Optional[str] = Header(None)):
-    """登入 → cookie/token/API格式を回報"""
+    """登入 → cookie/token/API路徑/JS源碼を解析"""
     verify_key(x_api_key)
     async with async_playwright() as p:
         browser = await launch_browser(p)
@@ -180,30 +180,77 @@ async def recon(req: FillRequest, x_api_key: Optional[str] = Header(None)):
 
         tokens = await extract_tokens(page)
 
-        # API endpoint テスト（GET → 存在確認）
-        api_get = await page.evaluate('''async () => {
-            try {
-                var r = await fetch("/wf/api/", {credentials:"same-origin"});
-                return {status:r.status, ok:r.ok};
-            } catch(e) { return {error:e.message}; }
-        }''')
+        # 全 XHR/fetch 攔截（パスフィルタなし — 全部記録）
+        all_requests = []
+        def on_request(req):
+            if req.resource_type in ('xhr', 'fetch', 'document'):
+                all_requests.append({
+                    'url': req.url[:200],
+                    'method': req.method,
+                    'type': req.resource_type,
+                })
+        page.on('request', on_request)
 
-        # XHR 攔截: AngularJS が使う API のリクエスト形式を観察
-        # フォームページを開いて、AngularJS が送る XHR を全部記録
-        intercepted = []
-        page.on('request', lambda req: intercepted.append({
-            'url': req.url, 'method': req.method,
-            'headers': dict(req.headers) if req.method == 'POST' else {},
-            'post': (req.post_data or '')[:500] if req.method == 'POST' else ''
-        }) if '/wf/api/' in req.url else None)
+        # WF ホームにいる状態で 5 秒間 XHR を観察
+        await page.wait_for_timeout(5000)
 
-        # フォームページを開く（表示はしないが、AngularJS の初期 API 呼出しを観察）
+        # フォームページに遷移して更に XHR を観察
         try:
             await page.goto(JOBCAN_WF_BASE + '/#/requests/new/666628',
                             wait_until='domcontentloaded', timeout=15000)
         except Exception:
             pass
         await page.wait_for_timeout(5000)
+
+        # JS 源碼から API パスを抽出（regex-free approach）
+        api_paths = await page.evaluate("""() => {
+            var paths = [];
+            var scripts = document.querySelectorAll("script");
+            for (var i = 0; i < scripts.length; i++) {
+                var text = scripts[i].textContent || "";
+                if (text.indexOf("api") === -1 && text.indexOf("requests") === -1) continue;
+                var words = text.split(/['"]/);
+                for (var j = 0; j < words.length; j++) {
+                    var w = words[j].trim();
+                    if (w.length > 3 && w.length < 100 && w.charAt(0) === "/") {
+                        if (w.indexOf("api") !== -1 || w.indexOf("requests") !== -1) {
+                            if (paths.indexOf(w) === -1) paths.push(w);
+                        }
+                    }
+                }
+            }
+            return paths.slice(0, 30);
+        }""")
+
+        # 外部 JS ファイルの URL も取得
+        script_srcs = await page.evaluate('''() => {
+            var srcs = [];
+            var scripts = document.querySelectorAll("script[src]");
+            for (var i = 0; i < scripts.length; i++) {
+                srcs.push(scripts[i].src);
+            }
+            return srcs;
+        }''')
+
+        # API パス探索: 複数の候補パスに GET を投げて存在確認
+        probe_paths = [
+            '/api/', '/wf/api/', '/api/v1/', '/wf/api/v1/',
+            '/api/requests/', '/wf/api/requests/',
+            '/api/v1/requests/', '/wf/api/v1/requests/',
+            '/expense/api/', '/workflow/api/',
+        ]
+        probe_results = await page.evaluate('''async (paths) => {
+            var results = [];
+            for (var i = 0; i < paths.length; i++) {
+                try {
+                    var r = await fetch(paths[i], {credentials: "same-origin"});
+                    results.push({path: paths[i], status: r.status});
+                } catch(e) {
+                    results.push({path: paths[i], error: e.message});
+                }
+            }
+            return results;
+        }''', probe_paths)
 
         await browser.close()
         return {
@@ -213,8 +260,10 @@ async def recon(req: FillRequest, x_api_key: Optional[str] = Header(None)):
                 'csrf': tokens['csrf'][:50] if tokens['csrf'] else None,
             },
             'all_cookies': tokens['all_cookies'],
-            'api_get_test': api_get,
-            'intercepted_api_calls': intercepted[:20],
+            'xhr_requests': all_requests[:30],
+            'js_api_paths': api_paths[:30],
+            'script_srcs': script_srcs[:10],
+            'path_probes': probe_results,
         }
 
 # ══════════════════════════════════════════════════════════
@@ -464,7 +513,8 @@ async def submit_item(page, item: FillPayload, tokens: dict, action: str) -> Fil
         print(f'[API] Attempt 1 (list): {body_json[:300]}...')
 
         result = await _do_fetch(page, body_json, xsrf, csrf)
-        print(f'[API] Attempt 1 result: HTTP {result.get("status")}')
+        used_path = result.get('path', '?')
+        print(f'[API] Attempt 1 result: HTTP {result.get("status")} via {used_path}')
 
         # 成功
         if result.get('ok'):
@@ -512,9 +562,17 @@ async def submit_item(page, item: FillPayload, tokens: dict, action: str) -> Fil
 
 
 async def _do_fetch(page, body_json: str, xsrf: str, csrf: str) -> dict:
-    """ブラウザ内 fetch() で Jobcan API に POST"""
+    """ブラウザ内 fetch() で Jobcan API に POST — 複数パスを試行"""
+    # 複数の API パスを試す（ssl.wf.jobcan.jp のパス構造が不明）
+    paths = [
+        '/wf/api/requests/new/',
+        '/api/requests/new/',
+        '/wf/api/v1/requests/new/',
+        '/api/v1/requests/new/',
+    ]
+
     return await page.evaluate('''async (args) => {
-        var body = args[0], xsrf = args[1], csrf = args[2];
+        var body = args[0], xsrf = args[1], csrf = args[2], paths = args[3];
         var headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -524,22 +582,33 @@ async def _do_fetch(page, body_json: str, xsrf: str, csrf: str) -> dict:
         if (xsrf) headers["X-XSRF-TOKEN"] = xsrf;
         if (csrf) headers["X-CSRFToken"] = csrf;
 
-        try {
-            var resp = await fetch("/wf/api/requests/new/", {
-                method: "POST",
-                headers: headers,
-                credentials: "same-origin",
-                body: body
-            });
-            var text = await resp.text();
-            var json = null;
-            try { json = JSON.parse(text); } catch(e) {}
-            return {ok: resp.ok, status: resp.status, statusText: resp.statusText,
-                    body: text.substring(0, 2000), json: json};
-        } catch(e) {
-            return {ok: false, status: 0, error: e.message};
+        // 各パスを順番に試す
+        for (var i = 0; i < paths.length; i++) {
+            try {
+                var resp = await fetch(paths[i], {
+                    method: "POST",
+                    headers: headers,
+                    credentials: "same-origin",
+                    body: body
+                });
+                var text = await resp.text();
+                var json = null;
+                try { json = JSON.parse(text); } catch(e) {}
+
+                // 404 以外 → この path が正しい（成功でもエラーでも）
+                if (resp.status !== 404) {
+                    return {ok: resp.ok, status: resp.status, statusText: resp.statusText,
+                            body: text.substring(0, 2000), json: json, path: paths[i]};
+                }
+            } catch(e) {
+                // fetch 自体が失敗 → 次のパスへ
+            }
         }
-    }''', [body_json, xsrf, csrf])
+
+        // 全パス 404
+        return {ok: false, status: 404, error: "All API paths returned 404: " + paths.join(", "),
+                tried_paths: paths};
+    }''', [body_json, xsrf, csrf, paths])
 
 
 def _build_success(item: FillPayload, filled: int, result: dict, action: str) -> FillResult:
